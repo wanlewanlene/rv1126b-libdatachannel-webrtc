@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Viewer - RV1126B</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: #14161a; color: #e6e8eb; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            display: flex; flex-direction: column; height: 100vh;
+        }
+        .toolbar {
+            display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+            background: #1e2228; border-bottom: 1px solid #2c313a; flex-wrap: wrap;
+        }
+        .toolbar label { font-size: 14px; color: #9aa3ad; white-space: nowrap; }
+        .toolbar input {
+            background: #0f1115; border: 1px solid #3a414b; color: #e6e8eb;
+            border-radius: 6px; padding: 7px 10px; font-size: 14px; outline: none;
+        }
+        .toolbar input:focus { border-color: #4f8cff; }
+        #ipInput { width: 160px; }
+        #portInput { width: 70px; }
+        #roomInput { width: 90px; }
+        .toolbar button {
+            background: #2f6fed; border: none; color: #fff; padding: 8px 18px;
+            border-radius: 6px; font-size: 14px; cursor: pointer; transition: background .15s;
+        }
+        .toolbar button:hover { background: #3d7bf5; }
+        .toolbar button:disabled { background: #3a414b; cursor: not-allowed; }
+        #status {
+            margin-left: auto; font-size: 13px; color: #8b949e; padding: 6px 10px;
+            background: #0f1115; border-radius: 6px; border: 1px solid #2c313a;
+        }
+        #status.connected { color: #3fb950; border-color: #2ea043; }
+        #status.error { color: #f85149; border-color: #f85149; }
+        .video-wrap {
+            flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px;
+            position: relative;
+        }
+        video {
+            max-width: 100%; max-height: 100%; background: #000; border-radius: 8px;
+            box-shadow: 0 4px 24px rgba(0,0,0,.5);
+            /* 多设备清晰呈现: 保持原生宽高比, 轻微增强对比/饱和提升观感 */
+            object-fit: contain;
+            image-rendering: auto;
+            filter: contrast(1.05) saturate(1.08);
+        }
+        .stats-panel {
+            position: absolute; top: 28px; left: 28px; display: none; gap: 12px; z-index: 10;
+        }
+        .stats-panel.show { display: flex; }
+        .stat-card {
+            background: rgba(10,12,16,.85); border: 1px solid #3a414b; border-radius: 10px;
+            padding: 10px 18px; min-width: 128px; text-align: center; backdrop-filter: blur(4px);
+        }
+        .stat-label { font-size: 12px; color: #9aa3ad; margin-bottom: 4px; letter-spacing: .5px; }
+        .stat-value {
+            font-size: 28px; font-weight: 700; color: #3fb950; line-height: 1.1;
+            font-variant-numeric: tabular-nums;
+        }
+        .stat-value.warn { color: #f0b429; }
+        .stat-value.bad { color: #f85149; }
+        .stat-sub { font-size: 11px; color: #6e7681; margin-top: 3px; }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <label>板卡 IP</label>
+        <input id="ipInput" type="text" value="192.168.137.184" placeholder="192.168.137.184">
+        <label>端口</label>
+        <input id="portInput" type="text" value="8080">
+        <label>房间</label>
+        <input id="roomInput" type="text" value="cam1">
+        <button id="connectBtn">连接</button>
+        <button id="muteBtn" disabled>静音</button>
+        <span id="status">未连接</span>
+    </div>
+    <div class="video-wrap">
+        <video id="remoteVideo" autoplay playsinline muted></video>
+        <div class="stats-panel" id="statsPanel">
+            <div class="stat-card">
+                <div class="stat-label">实时帧率 FPS</div>
+                <div class="stat-value" id="fpsVal">--</div>
+                <div class="stat-sub" id="fpsSub">等待连接</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">实时延迟</div>
+                <div class="stat-value" id="latVal">--</div>
+                <div class="stat-sub">ms (jitter buffer + RTT)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">视频码率</div>
+                <div class="stat-value" id="brVal">--</div>
+                <div class="stat-sub">kbps · 自适应</div>
+            </div>
+        </div>
+    </div>
+    <audio id="remoteAudio" autoplay playsinline></audio>
+
+    <script>
+        const ipInput = document.getElementById('ipInput');
+        const portInput = document.getElementById('portInput');
+        const roomInput = document.getElementById('roomInput');
+        const connectBtn = document.getElementById('connectBtn');
+        const muteBtn = document.getElementById('muteBtn');
+        const statusEl = document.getElementById('status');
+        const video = document.getElementById('remoteVideo');
+        const audio = document.getElementById('remoteAudio');
+
+        let pc = null;
+        let ws = null;
+        let audioMuted = false;
+
+        // ===== 实时监测面板 + 自动码率优化 =====
+        const statsPanel = document.getElementById('statsPanel');
+        const fpsVal = document.getElementById('fpsVal');
+        const fpsSub = document.getElementById('fpsSub');
+        const latVal = document.getElementById('latVal');
+        const brVal  = document.getElementById('brVal');
+
+        // 480p 版码率: 与板端 pre720p BITRATE (1Mbps) 一致
+        const BITRATE_INIT = 1024 * 1024;
+        const BITRATE_MIN  = 400  * 1024;
+        const BITRATE_MAX  = 1024 * 1024;
+        let currentBitrate = BITRATE_INIT;
+        let lastVideoFrames = null, lastTs = 0;
+        let badStreak = 0, goodStreak = 0;
+
+        function setStat(el, val, warn, bad) {
+            el.textContent = val;
+            el.className = 'stat-value' + (bad ? ' bad' : warn ? ' warn' : '');
+        }
+
+        async function sampleStats() {
+            if (!pc || pc.connectionState !== 'connected') return;
+            try {
+                const stats = await pc.getStats();
+                const now = performance.now();
+                let frames = null, jitDelay = 0, jitCount = 0, rttMs = 0, resText = '';
+                stats.forEach(v => {
+                    if (v.type === 'inbound-rtp' && v.kind === 'video') {
+                        frames = v.framesDecoded;
+                        jitDelay = v.jitterBufferDelay || 0;          // 秒(累计)
+                        jitCount = v.jitterBufferEmittedCount || 0;
+                        if (v.frameWidth && v.frameHeight) {
+                            resText = v.frameWidth + 'x' + v.frameHeight;
+                        }
+                    }
+                    if (v.type === 'candidate-pair' && v.nominated &&
+                        v.currentRoundTripTime != null) {
+                        rttMs = v.currentRoundTripTime * 1000;         // ms
+                    }
+                });
+                if (frames == null) return;
+
+                // ---- 实时 FPS (滑动平均, 基于 framesDecoded 差值) ----
+                let fps = null;
+                if (lastVideoFrames != null && now > lastTs) {
+                    fps = (frames - lastVideoFrames) / ((now - lastTs) / 1000);
+                }
+                lastVideoFrames = frames; lastTs = now;
+
+                // ---- 实时延迟 = RTT + jitter buffer 平均延迟 ----
+                const jitMs = jitCount > 0 ? (jitDelay / jitCount) * 1000 : 0;
+                const latencyMs = Math.round(rttMs + jitMs);
+
+                if (fps != null) {
+                    const f = Math.round(fps);
+                    setStat(fpsVal, f, f < 25, f < 18);
+                    fpsSub.textContent = (f >= 25 ? '流畅' : f >= 18 ? '偏低' : '卡顿') +
+                                         (resText ? ' · ' + resText : '');
+                }
+                setStat(latVal, latencyMs, latencyMs > 250, latencyMs > 450);
+                brVal.textContent = Math.round(currentBitrate / 1024);
+
+                // ---- 自动优化 (迟滞: 连续多次才动作, 避免震荡) ----
+                const bad = (fps != null && fps < 18) || latencyMs > 450;
+                if (bad) { badStreak++; goodStreak = 0; }
+                else if (fps != null) { goodStreak++; badStreak = 0; }
+
+                if (badStreak >= 3 && currentBitrate > BITRATE_MIN) {
+                    currentBitrate = Math.max(BITRATE_MIN, Math.round(currentBitrate * 0.8 / 65536) * 65536);
+                    badStreak = 0;
+                    sendAdjust();
+                } else if (goodStreak >= 5 && currentBitrate < BITRATE_MAX) {
+                    currentBitrate = Math.min(BITRATE_MAX, currentBitrate + 131072);
+                    goodStreak = 0;
+                    sendAdjust();
+                }
+            } catch (e) {}
+        }
+
+        function sendAdjust() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'adjust', room: roomInput.value.trim() || 'cam1',
+                                         bitrate: String(currentBitrate) }));
+            }
+            brVal.textContent = Math.round(currentBitrate / 1024);
+        }
+        setInterval(sampleStats, 2000);
+
+        // 静音开关 (音频默认开; 自动播放策略可能需用户手势, 这里提供手动恢复入口)
+        muteBtn.addEventListener('click', () => {
+            audioMuted = !audioMuted;
+            audio.muted = audioMuted;
+            muteBtn.textContent = audioMuted ? '取消静音' : '静音';
+            if (!audioMuted) audio.play().catch(() => {});
+        });
+
+        function setStatus(text, cls) {
+            statusEl.textContent = text;
+            statusEl.className = cls || '';
+        }
+
+        function getWsUrl() {
+            const ip = ipInput.value.trim();
+            const port = portInput.value.trim();
+            return `ws://${ip}:${port}`;
+        }
+
+        function connect() {
+            const room = roomInput.value.trim() || 'cam1';
+            const wsUrl = getWsUrl();
+
+            // 清理旧连接
+            if (ws) { ws.close(); ws = null; }
+            if (pc) { pc.close(); pc = null; }
+            video.srcObject = null;
+            audio.srcObject = null;
+            muteBtn.disabled = true;
+
+            // 重置监测面板与自适应状态
+            statsPanel.classList.add('show');
+            lastVideoFrames = null; lastTs = 0; badStreak = 0; goodStreak = 0;
+            currentBitrate = BITRATE_INIT;
+            fpsVal.textContent = '--'; latVal.textContent = '--'; brVal.textContent = '1024';
+            fpsSub.textContent = '等待连接';
+
+            setStatus('连接信令服务器...');
+
+            pc = new RTCPeerConnection({
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'turn:' + (ipInput.value.trim() || '192.168.137.184') + ':3478', username: 'webrtc', credential: 'webrtc123' }
+                ]
+            });
+
+            pc.ontrack = (event) => {
+                const stream = event.streams[0];
+                if (event.track.kind === 'video') {
+                    video.srcObject = stream;
+                    setStatus('视频流已连接', 'connected');
+                } else if (event.track.kind === 'audio') {
+                    audio.srcObject = stream;
+                    audio.muted = audioMuted;
+                    // 显式播放: 连接动作本身是用户手势, 一般可突破自动播放限制
+                    audio.play().catch(() => {});
+                    muteBtn.disabled = false;
+                    setStatus('音视频流已连接', 'connected');
+                }
+                // 消除累计延迟: 延迟优先于流畅 (允许视频卡顿)
+                // 视频 jitter buffer 钳制 40ms: 晚到的帧丢弃/跳帧(表现为卡顿), 浏览器主动追帧, 延迟恒定不累积
+                // 音频钳制 60ms: NetEq 用 PLC 保持连续, 低于此会频繁断续; 视频目标<=音频, 唇音同步差 <=20ms 无感
+                try {
+                    const receiver = pc.getReceivers().find(r => r.track === event.track);
+                    if (receiver) {
+                        if (event.track.kind === 'audio' && receiver.playoutDelayHint !== undefined) {
+                            receiver.playoutDelayHint = 0.06;
+                        }
+                        if (event.track.kind === 'video' && receiver.jitterBufferTarget !== undefined) {
+                            receiver.jitterBufferTarget = 0.04;
+                        }
+                    }
+                } catch (e) {}
+            };
+
+            pc.onconnectionstatechange = () => {
+                if (pc.connectionState === 'connected') {
+                    setStatus('已连接: ' + pc.connectionState, 'connected');
+                } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                    setStatus('连接状态: ' + pc.connectionState, 'error');
+                }
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'ice', room: room,
+                        candidate: event.candidate.candidate,
+                        mid: event.candidate.sdpMid
+                    }));
+                }
+            };
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                setStatus('已连信令, 加入房间 ' + room + ' ...');
+                ws.send(JSON.stringify({ type: 'viewer_join', room: room }));
+            };
+
+            ws.onmessage = async (e) => {
+                let msg;
+                try { msg = JSON.parse(e.data); } catch (err) { return; }
+
+                if (msg.type === 'offer') {
+                    setStatus('收到 offer, 建立对等连接...');
+                    try {
+                        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+                        const answer = await pc.createAnswer();
+                        await pc.setLocalDescription(answer);
+                        ws.send(JSON.stringify({ type: 'answer', room: room, sdp: answer.sdp }));
+                        setStatus('已回 answer, 等待连接...');
+                    } catch (err) {
+                        console.error('offer 处理失败', err);
+                        setStatus('offer 处理失败: ' + err.message, 'error');
+                    }
+                } else if (msg.type === 'ice') {
+                    if (msg.candidate) {
+                        try {
+                            await pc.addIceCandidate({ candidate: msg.candidate, sdpMid: msg.mid });
+                        } catch (err) {
+                            console.error('addIceCandidate error', err);
+                        }
+                    }
+                }
+            };
+
+            ws.onerror = () => setStatus('信令连接错误', 'error');
+            ws.onclose = () => setStatus('信令连接断开', 'error');
+        }
+
+        connectBtn.addEventListener('click', connect);
+
+        // 页面加载时若通过 http 访问且 hostname 非 localhost, 自动用 hostname; 否则用默认 IP
+        window.addEventListener('DOMContentLoaded', () => {
+            const hn = location.hostname;
+            if (hn && hn !== 'localhost' && hn !== '127.0.0.1' && location.protocol.startsWith('http')) {
+                ipInput.value = hn;
+            }
+        });
+    </script>
+</body>
+</html>
