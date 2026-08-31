@@ -14,6 +14,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <alsa/asoundlib.h>   // ALSA 音频采集 (板载 MIC)
+#include <opus/opus.h>        // Opus 音频编码 (WebRTC 标准音频编解码)
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -37,6 +40,14 @@ static constexpr const char* CAM_DEV    = "/dev/video52"; // HD USB Camera
 static constexpr const char* SIGNALING_URL = "ws://127.0.0.1:8080";
 static constexpr const char* ROOM       = "cam1";
 static constexpr const char* STUN_SERVER = "stun:stun.l.google.com:19302";
+
+// 音频采集/编码参数 (板载 MIC -> Opus -> WebRTC 音频 track)
+static constexpr const char* AUDIO_DEV      = "default";   // ALSA 录音设备 (arecord -l 的 card0)
+static constexpr int         AUDIO_RATE     = 48000;       // 采样率 (Opus 原生 48kHz)
+static constexpr int         AUDIO_CHANNELS = 2;           // 声道数 (立体声, 与 mic 采样一致)
+static constexpr int         AUDIO_FRAME_MS = 20;          // Opus 帧长 20ms (960 样本 @48k)
+static constexpr uint32_t    AUDIO_BITRATE  = 32000;       // Opus 目标码率 32 kbps
+static constexpr int         AUDIO_PAYLOAD_TYPE = 111;     // Opus RTP payload type (避免与视频 96 冲突)
 
 static std::atomic<bool> g_running{true};
 // 浏览器通过 RTCP PLI/FIR 请求关键帧时置位, 主循环据此强制编码器输出 IDR
@@ -253,34 +264,8 @@ public:
             return false;
         }
 
-        MppEncCfg cfg;
-        mpp_enc_cfg_init(&cfg);
-        mpp_enc_cfg_set_s32(cfg, "prep:width", width_);
-        mpp_enc_cfg_set_s32(cfg, "prep:height", height_);
-        mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", hor_stride_);
-        mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", ver_stride_);
-        mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
-        mpp_enc_cfg_set_s32(cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
-        mpp_enc_cfg_set_s32(cfg, "rc:bps_target", (RK_S32)bitrate);
-        mpp_enc_cfg_set_s32(cfg, "rc:bps_max", (RK_S32)bitrate);
-        mpp_enc_cfg_set_s32(cfg, "rc:bps_min", (RK_S32)bitrate);
-        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
-        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps);
-        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
-        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_flex", 0);
-        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num", fps);
-        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm", 1);
-        mpp_enc_cfg_set_s32(cfg, "rc:gop", fps * 2);
-        mpp_enc_cfg_set_s32(cfg, "codec:type", MPP_VIDEO_CodingAVC);
-        mpp_enc_cfg_set_s32(cfg, "h264:profile", 100);       // High
-        mpp_enc_cfg_set_s32(cfg, "h264:level", 40);
-
-        ret = mpi_->control(ctx_, MPP_ENC_SET_CFG, cfg);
-        if (ret != MPP_OK) {
-            std::cerr << "[MPP] MPP_ENC_SET_CFG failed" << std::endl;
-            return false;
-        }
-        mpp_enc_cfg_deinit(cfg);
+        fps_ = fps;
+        if (!applyCfg(bitrate)) return false;
 
         // 输入 buffer group (DRM 优先, 回退 ION)
         ret = mpp_buffer_group_get_internal(&group_, MPP_BUFFER_TYPE_DRM);
@@ -303,6 +288,50 @@ public:
                   << " @" << fps << "fps " << (bitrate / 1024) << "kbps (input NV12, conv from YUYV)" << std::endl;
         return true;
     }
+
+    // 构建完整编码配置并应用 (init 与运行时调码率共用)
+    bool applyCfg(uint32_t bitrate) {
+        MppEncCfg cfg;
+        mpp_enc_cfg_init(&cfg);
+        mpp_enc_cfg_set_s32(cfg, "prep:width", width_);
+        mpp_enc_cfg_set_s32(cfg, "prep:height", height_);
+        mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", hor_stride_);
+        mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", ver_stride_);
+        mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
+        mpp_enc_cfg_set_s32(cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
+        mpp_enc_cfg_set_s32(cfg, "rc:bps_target", (RK_S32)bitrate);
+        mpp_enc_cfg_set_s32(cfg, "rc:bps_max", (RK_S32)bitrate);
+        mpp_enc_cfg_set_s32(cfg, "rc:bps_min", (RK_S32)bitrate);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps_);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_flex", 0);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num", fps_);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm", 1);
+        mpp_enc_cfg_set_s32(cfg, "rc:gop", fps_ * 2);
+        mpp_enc_cfg_set_s32(cfg, "codec:type", MPP_VIDEO_CodingAVC);
+        mpp_enc_cfg_set_s32(cfg, "h264:profile", 100);       // High
+        mpp_enc_cfg_set_s32(cfg, "h264:level", 40);
+
+        MPP_RET ret = mpi_->control(ctx_, MPP_ENC_SET_CFG, cfg);
+        mpp_enc_cfg_deinit(cfg);
+        if (ret != MPP_OK) {
+            std::cerr << "[MPP] MPP_ENC_SET_CFG failed" << std::endl;
+            return false;
+        }
+        current_bitrate_ = bitrate;
+        return true;
+    }
+
+    // 运行时动态调整码率 (MPP 热更新码控, 不中断编码)
+    void setBitrate(uint32_t bps) {
+        if (!ctx_ || !mpi_ || bps == current_bitrate_) return;
+        if (applyCfg(bps)) {
+            std::cout << "[MPP] bitrate adjusted -> " << (bps / 1024) << "kbps" << std::endl;
+        }
+    }
+
+    uint32_t currentBitrate() const { return current_bitrate_; }
 
     // 编码一帧 YUYV, 输出 Annex-B H.264 数据, 通过 onPacket 回调
     // 返回 false 表示失败 (程序应退出)
@@ -417,9 +446,116 @@ private:
     MppBuffer enc_buf_ = nullptr;  // 一次性分配、逐帧复用的输入缓冲区（避免每帧新建 dmabuf 导致 fd 泄漏）
     int width_ = 0, height_ = 0;
     int hor_stride_ = 0, ver_stride_ = 0;
+    int fps_ = 30;
+    uint32_t current_bitrate_ = 0;
     size_t src_stride_ = 0;   // 源 YUYV 行字节跨度
     size_t frame_size_ = 0;
     int64_t pts_ = 0;
+};
+
+// ----------------------------------------------------------------------------
+// ALSA 音频采集 (板载 MIC, S16_LE 交错)
+// ----------------------------------------------------------------------------
+class AlsaCapture {
+public:
+    bool init(const char* dev, unsigned int rate, unsigned int channels, unsigned int frame_samples) {
+        int err = snd_pcm_open(&handle_, dev, SND_PCM_STREAM_CAPTURE, 0);
+        if (err < 0) {
+            std::cerr << "[ALSA] open '" << dev << "' failed: " << snd_strerror(err) << std::endl;
+            return false;
+        }
+
+        snd_pcm_hw_params_t* params;
+        snd_pcm_hw_params_alloca(&params);
+        snd_pcm_hw_params_any(handle_, params);
+
+        snd_pcm_hw_params_set_access(handle_, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+        snd_pcm_hw_params_set_format(handle_, params, SND_PCM_FORMAT_S16_LE);
+        snd_pcm_hw_params_set_channels(handle_, params, channels);
+
+        unsigned int r = rate;
+        snd_pcm_hw_params_set_rate_near(handle_, params, &r, 0);
+
+        snd_pcm_uframes_t period = frame_samples;
+        snd_pcm_hw_params_set_period_size_near(handle_, params, &period, 0);
+        snd_pcm_hw_params_set_periods(handle_, params, 4, 0);   // 4 个 period 缓冲 (~80ms)
+
+        if ((err = snd_pcm_hw_params(handle_, params)) < 0) {
+            std::cerr << "[ALSA] hw_params failed: " << snd_strerror(err) << std::endl;
+            snd_pcm_close(handle_);
+            handle_ = nullptr;
+            return false;
+        }
+        if ((err = snd_pcm_prepare(handle_)) < 0) {
+            std::cerr << "[ALSA] prepare failed: " << snd_strerror(err) << std::endl;
+            snd_pcm_close(handle_);
+            handle_ = nullptr;
+            return false;
+        }
+
+        rate_ = r;
+        channels_ = channels;
+        frame_samples_ = static_cast<unsigned int>(period);
+        std::cout << "[ALSA] capture ready: " << rate_ << "Hz " << channels_
+                  << "ch period=" << frame_samples_ << " frames" << std::endl;
+        return true;
+    }
+
+    // 读取 frames 帧 (阻塞), 返回实际读取帧数; 负数表示错误, 0 表示欠载已恢复
+    int read(int16_t* buf, unsigned int frames) {
+        snd_pcm_sframes_t n = snd_pcm_readi(handle_, buf, frames);
+        if (n < 0) {
+            if (n == -EPIPE) {          // xrun, 恢复后返回 0
+                snd_pcm_prepare(handle_);
+                return 0;
+            }
+            return static_cast<int>(n); // 其他错误
+        }
+        return static_cast<int>(n);
+    }
+
+    ~AlsaCapture() {
+        if (handle_) snd_pcm_close(handle_);
+    }
+
+private:
+    snd_pcm_t* handle_ = nullptr;
+    unsigned int rate_ = 0;
+    unsigned int channels_ = 0;
+    unsigned int frame_samples_ = 0;
+};
+
+// ----------------------------------------------------------------------------
+// Opus 编码器封装 (PCM S16_LE -> Opus 帧)
+// ----------------------------------------------------------------------------
+class OpusEncoderWrap {
+public:
+    bool init(int rate, int channels, uint32_t bitrate) {
+        int err = 0;
+        enc_ = opus_encoder_create(rate, channels, OPUS_APPLICATION_VOIP, &err);
+        if (err != OPUS_OK || !enc_) {
+            std::cerr << "[OPUS] encoder_create failed: " << opus_strerror(err) << std::endl;
+            return false;
+        }
+        opus_encoder_ctl(enc_, OPUS_SET_BITRATE(static_cast<opus_int32>(bitrate)));
+        // 语音场景关闭 DTX, 保持连续 (避免静音段浏览器检测异常)
+        opus_encoder_ctl(enc_, OPUS_SET_DTX(0));
+        channels_ = channels;
+        return true;
+    }
+
+    // 返回编码后字节数 (>0), 负数错误
+    int encode(const int16_t* pcm, int frame_samples, unsigned char* out, int max_out) {
+        return opus_encode(enc_, pcm, frame_samples, out, max_out);
+    }
+
+    ~OpusEncoderWrap() {
+        if (enc_) opus_encoder_destroy(enc_);
+    }
+
+private:
+    OpusEncoder* enc_ = nullptr;
+    int channels_ = 0;
 };
 
 // ----------------------------------------------------------------------------
@@ -436,7 +572,7 @@ public:
         // 创建 H.264 视频 track (SendOnly)
         rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
         video.addH264Codec(96);
-        video.addSSRC(42, std::string("video-send"));
+        video.addSSRC(42, std::string("video-send"), std::string("stream1"), std::string("video"));
 
         track_ = pc_->addTrack(video);
 
@@ -456,6 +592,21 @@ public:
             g_request_idr = true;
         }));
         track_->setMediaHandler(packetizer);
+
+        // 创建 Opus 音频 track (SendOnly) —— 与视频共用 msid="stream1" 以便浏览器音视频同步
+        rtc::Description::Audio audio("audio", rtc::Description::Direction::SendOnly);
+        audio.addOpusCodec(AUDIO_PAYLOAD_TYPE);  // Opus, 默认 profile: minptime=10;stereo=1;useinbandfec=1
+        audio.addSSRC(43, std::string("audio-send"), std::string("stream1"), std::string("audio"));
+
+        audio_track_ = pc_->addTrack(audio);
+
+        audio_rtp_config_ = std::make_shared<rtc::RtpPacketizationConfig>(
+            43, "audio-send", AUDIO_PAYLOAD_TYPE, 48000);  // Opus RTP 时钟 48kHz
+        auto audio_packetizer = std::make_shared<rtc::OpusRtpPacketizer>(audio_rtp_config_);
+        // RTCP SR 上报: 音频与视频共用同一 start_time_ 时钟源, 浏览器据此将 RTP 时间戳
+        // 对齐到同一 NTP 时间轴, 实现唇音同步 (lip-sync)
+        audio_packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(audio_rtp_config_));
+        audio_track_->setMediaHandler(audio_packetizer);
 
         ws_ = std::make_shared<rtc::WebSocket>();
 
@@ -532,6 +683,22 @@ public:
         }
     }
 
+    // 发送 Opus 音频帧 (与视频共用 start_time_ 时钟, 保证音视频时间戳同源)
+    void send_audio(const uint8_t* data, size_t size) {
+        if (!connected_ || !audio_track_ || !audio_track_->isOpen()) return;
+        try {
+            auto elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_time_);
+            audio_track_->sendFrame(reinterpret_cast<const std::byte*>(data), size,
+                                    rtc::FrameInfo(elapsed));
+        } catch (const std::exception& e) {
+            std::cerr << "[RTC] audio send failed: " << e.what() << std::endl;
+        }
+    }
+
+    // 注册码率调整回调 (监测面板自动优化用)
+    void setAdjustHandler(std::function<void(uint32_t)> cb) { adjust_cb_ = std::move(cb); }
+
     bool connected() const { return connected_; }
 
 private:
@@ -563,6 +730,15 @@ private:
             // viewer 加入后请求重新发送 offer (重发缓存的 SDP)
             std::cout << "[SIG] request_offer received, re-sending offer" << std::endl;
             send_offer();
+        } else if (type == "adjust") {
+            // 监测面板自动优化: 浏览器上报 FPS/延迟, 动态调整视频码率
+            std::string bps_str = json_get_str(text, "bitrate");
+            if (!bps_str.empty() && adjust_cb_) {
+                uint32_t bps = 0;
+                try { bps = (uint32_t)std::stoul(bps_str); } catch (...) { return; }
+                std::cout << "[SIG] adjust: bitrate -> " << (bps / 1024) << "kbps" << std::endl;
+                adjust_cb_(bps);
+            }
         }
     }
 
@@ -579,12 +755,15 @@ private:
 
     std::shared_ptr<rtc::PeerConnection> pc_;
     std::shared_ptr<rtc::Track> track_;
+    std::shared_ptr<rtc::Track> audio_track_;
     std::shared_ptr<rtc::WebSocket> ws_;
     std::shared_ptr<rtc::RtpPacketizationConfig> rtpConfig_;
+    std::shared_ptr<rtc::RtpPacketizationConfig> audio_rtp_config_;
     std::chrono::steady_clock::time_point start_time_{std::chrono::steady_clock::now()};
     std::string room_;
     std::string local_sdp_;
     std::atomic<bool> connected_{false};
+    std::function<void(uint32_t)> adjust_cb_;
 };
 
 // ----------------------------------------------------------------------------
@@ -615,11 +794,49 @@ int main() {
 
     // 3. 初始化 WebRTC + 信令
     WebRTCStreamer streamer;
+    streamer.setAdjustHandler([&encoder](uint32_t bps) { encoder.setBitrate(bps); });
     streamer.start(SIGNALING_URL, ROOM);
+
+    // 3.5 初始化音频: ALSA 采集 + Opus 编码, 在独立线程中运行 (与视频共用 start_time_ 时钟)
+    AlsaCapture audio_cap;
+    OpusEncoderWrap opus_enc;
+    std::thread audio_thread;
+    const int audio_frame_samples = AUDIO_RATE * AUDIO_FRAME_MS / 1000;  // 960 样本 (20ms)
+    if (audio_cap.init(AUDIO_DEV, AUDIO_RATE, AUDIO_CHANNELS, audio_frame_samples) &&
+        opus_enc.init(AUDIO_RATE, AUDIO_CHANNELS, AUDIO_BITRATE)) {
+        audio_thread = std::thread([&]() {
+            std::vector<int16_t> pcm(audio_frame_samples * AUDIO_CHANNELS);
+            std::vector<uint8_t> opus_buf(1500);  // Opus 帧最大 < 1275 字节
+            while (g_running) {
+                // 凑满一个 Opus 帧 (处理 ALSA 可能的短读)
+                int got = 0;
+                while (got < audio_frame_samples && g_running) {
+                    int n = audio_cap.read(pcm.data() + got * AUDIO_CHANNELS,
+                                           audio_frame_samples - got);
+                    if (n < 0) {
+                        std::cerr << "[ALSA] read error: " << snd_strerror(n) << std::endl;
+                        break;
+                    }
+                    if (n == 0) continue;  // xrun 已恢复
+                    got += n;
+                }
+                if (got <= 0) continue;
+
+                int bytes = opus_enc.encode(pcm.data(), got, opus_buf.data(),
+                                            static_cast<int>(opus_buf.size()));
+                if (bytes > 0) {
+                    streamer.send_audio(opus_buf.data(), static_cast<size_t>(bytes));
+                }
+            }
+        });
+        std::cout << "[AUDIO] audio capture thread started" << std::endl;
+    } else {
+        std::cerr << "[AUDIO] audio init failed, continuing with video only" << std::endl;
+    }
 
     std::cout << "==> streaming started, waiting for viewer ..." << std::endl;
 
-    // 4. 采集-编码-推流主循环
+    // 4. 采集-编码-推流主循环 (视频)
     const uint8_t* frame_data = nullptr;
     size_t frame_size = 0;
     while (g_running) {
@@ -646,6 +863,9 @@ int main() {
     }
 
     std::cout << "==> stopping ..." << std::endl;
+
+    // 停止音频线程 (阻塞 readi 最多 20ms 后返回)
+    if (audio_thread.joinable()) audio_thread.join();
 
     // 发送 EOS 并排空 MPP 内部缓冲
     encoder.flush([](const uint8_t* h264, size_t len) {
