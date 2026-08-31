@@ -1,7 +1,13 @@
 // ============================================================================
 // RV1126B (ELF 板) WebRTC 低延迟视频推流主程序
-// 架构: V4L2 摄像头采集 -> RK MPP 硬编码 (H.264) -> libdatachannel WebRTC 推流
+// 架构: V4L2 摄像头采集 (MJPG 1280x720) -> RK MPP 硬解 (MJPG->NV12)
+//       -> RK MPP 硬编码 (H.264) -> libdatachannel WebRTC 推流
 // 信令: 通过 libdatachannel 内置 WebSocket 连接 Node.js 信令服务器
+//
+// 画质优化 (2026-08-31):
+//   1. 分辨率 640x480 -> MJPG 1280x720 (YUYV 720p 仅 9fps, 不可用; 走硬解)
+//   2. 码率 1Mbps -> 4Mbps (减少压缩伪影, 保留细节)
+//   3. 摄像头 ISP 控件: sharpness/gamma/gain/contrast/saturation (锐度/低光)
 // ============================================================================
 
 #include <rtc/rtc.hpp>
@@ -16,6 +22,8 @@
 
 #include <alsa/asoundlib.h>   // ALSA 音频采集 (板载 MIC)
 #include <opus/opus.h>        // Opus 音频编码 (WebRTC 标准音频编解码)
+#include <jpeglib.h>          // libjpeg-turbo: MJPG 软件解码 (NEON 加速)
+#include <csetjmp>
 
 #include <atomic>
 #include <chrono>
@@ -32,14 +40,23 @@
 // ----------------------------------------------------------------------------
 // 可调配置
 // ----------------------------------------------------------------------------
-static constexpr int    WIDTH          = 640;       // 采集/编码宽度 (USB 摄像头 YUYV 640x480@30fps)
-static constexpr int    HEIGHT         = 480;       // 采集/编码高度
+static constexpr int    WIDTH          = 1280;      // 采集/编码宽度 (MJPG 720p, 摄像头 YUYV 720p 仅 9fps 不可用)
+static constexpr int    HEIGHT         = 720;       // 采集/编码高度
 static constexpr int    FPS            = 30;        // 帧率
-static constexpr uint32_t BITRATE      = 1024 * 1024; // 目标码率 1 Mbps
+static constexpr uint32_t BITRATE      = 4 * 1024 * 1024; // 目标码率 4 Mbps (细节/伪影)
 static constexpr const char* CAM_DEV    = "/dev/video52"; // HD USB Camera
 static constexpr const char* SIGNALING_URL = "ws://127.0.0.1:8080";
 static constexpr const char* ROOM       = "cam1";
 static constexpr const char* STUN_SERVER = "stun:stun.l.google.com:19302";
+
+// 摄像头 ISP 控件调优 (范围以 v4l2-ctl -L 实测: sharpness 1-7, gamma 100-300,
+// gain 0-100, contrast 0-95, saturation 0-128, brightness -64..64)
+static constexpr int    CTRL_SHARPNESS   = 6;     // 默认 2 -> 6 (边缘锐度)
+static constexpr int    CTRL_GAMMA       = 200;   // 默认 100 -> 200 (暗部细节)
+static constexpr int    CTRL_GAIN        = 30;    // 默认 0 -> 30 (低光增益)
+static constexpr int    CTRL_CONTRAST    = 58;    // 默认 48 -> 58 (对比度)
+static constexpr int    CTRL_SATURATION  = 76;    // 默认 64 -> 76 (色彩)
+static constexpr int    CTRL_BRIGHTNESS  = 0;     // 保持默认
 
 // 音频采集/编码参数 (板载 MIC -> Opus -> WebRTC 音频 track)
 static constexpr const char* AUDIO_DEV      = "default";   // ALSA 录音设备 (arecord -l 的 card0)
@@ -115,33 +132,43 @@ class V4L2Capture {
 public:
     size_t row_stride() const { return bytesperline_ ? bytesperline_ : width_ * 2; }
 
-    bool init(const char* dev, int width, int height) {
+    bool init(const char* dev, int width, int height, uint32_t pixfmt, int fps) {
         fd_ = open(dev, O_RDWR | O_NONBLOCK);
         if (fd_ < 0) {
             std::cerr << "[V4L2] open " << dev << " failed" << std::endl;
             return false;
         }
 
-        // USB 摄像头为单平面 (Video Capture), YUYV 格式
+        // USB 摄像头为单平面 (Video Capture), 支持 YUYV / MJPG
         v4l2_format fmt{};
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         fmt.fmt.pix.width = width;
         fmt.fmt.pix.height = height;
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+        fmt.fmt.pix.pixelformat = pixfmt;
         fmt.fmt.pix.field = V4L2_FIELD_NONE;
         if (ioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) {
             std::cerr << "[V4L2] VIDIOC_S_FMT failed" << std::endl;
             close(fd_); fd_ = -1; return false;
         }
-        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
-            std::cerr << "[V4L2] driver does not support YUYV (got 0x"
+        if (fmt.fmt.pix.pixelformat != pixfmt) {
+            std::cerr << "[V4L2] driver does not support requested format (got 0x"
                       << std::hex << fmt.fmt.pix.pixelformat << std::dec
                       << ")" << std::endl;
             close(fd_); fd_ = -1; return false;
         }
         width_ = fmt.fmt.pix.width;
         height_ = fmt.fmt.pix.height;
-        bytesperline_ = fmt.fmt.pix.bytesperline;  // YUYV 行字节跨度 (通常 = width*2)
+        bytesperline_ = fmt.fmt.pix.bytesperline;  // MJPG 为 0, YUYV 通常 = width*2
+        fmt_desc_ = (pixfmt == V4L2_PIX_FMT_MJPEG) ? "MJPG" : "YUYV";
+
+        // 设置帧率
+        v4l2_streamparm parm{};
+        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        parm.parm.capture.timeperframe.numerator = 1;
+        parm.parm.capture.timeperframe.denominator = fps;
+        if (ioctl(fd_, VIDIOC_S_PARM, &parm) < 0) {
+            std::cerr << "[V4L2] VIDIOC_S_PARM failed (fps may use default)" << std::endl;
+        }
 
         v4l2_requestbuffers req{};
         req.count = 4;
@@ -188,8 +215,32 @@ public:
             close(fd_); fd_ = -1; return false;
         }
         std::cout << "[V4L2] camera initialized: " << width_ << "x" << height_
-                  << " YUYV" << std::endl;
+                  << " " << fmt_desc_ << " @" << fps << "fps" << std::endl;
         return true;
+    }
+
+    // 设置单个 V4L2 控件 (锐度/gamma/增益/对比度等)
+    void set_ctrl(uint32_t id, int value) {
+        v4l2_control ctrl{};
+        ctrl.id = id;
+        ctrl.value = value;
+        if (ioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+            std::cerr << "[V4L2] set ctrl 0x" << std::hex << id << std::dec
+                      << "=" << value << " failed" << std::endl;
+        } else {
+            std::cout << "[V4L2] ctrl 0x" << std::hex << id << std::dec
+                      << " -> " << value << std::endl;
+        }
+    }
+
+    // 画质控件调优 (锐度/低光/对比度/色彩)
+    void apply_ctrls() {
+        set_ctrl(V4L2_CID_SHARPNESS, CTRL_SHARPNESS);
+        set_ctrl(V4L2_CID_GAMMA,     CTRL_GAMMA);
+        set_ctrl(V4L2_CID_GAIN,      CTRL_GAIN);
+        set_ctrl(V4L2_CID_CONTRAST,  CTRL_CONTRAST);
+        set_ctrl(V4L2_CID_SATURATION, CTRL_SATURATION);
+        set_ctrl(V4L2_CID_BRIGHTNESS, CTRL_BRIGHTNESS);
     }
 
     // 阻塞获取一帧, 返回 true 表示成功; data/size 指向 mmap 缓冲 (下次 dequeue 前有效)
@@ -234,11 +285,118 @@ private:
     int height_ = 0;
     size_t bytesperline_ = 0;
     uint32_t last_index_ = 0;
+    std::string fmt_desc_;
     std::vector<Buffer> buffers_;
 };
 
 // ----------------------------------------------------------------------------
-// RK MPP 硬编码器 (H.264, Annex-B 输出)
+// MJPG 软件解码器 (libjpeg-turbo, NEON 加速) -> NV12/YUV420SP
+// 说明: 该板 MPP(kmpp) 的 MJPG 硬解路径在自定义程序中无法输出帧
+// (gdb 对比 mpi_dec_test: 同样的 EXT_BUF_GROUP/FRAME_INFO/DMA packet 组合
+//  仍卡死/无输出), 故改用 libjpeg-turbo 软解。720p 单帧约 10ms, 四核 CPU
+// 负载约 +25%, 可接受。
+// 输出: Y 平面直接写入编码器输入 buffer (stride 可控), U/V 解码到临时
+// 平面后交织为 NV12 的 UV 平面。
+// ----------------------------------------------------------------------------
+static jmp_buf g_jpeg_jmp;   // libjpeg 错误恢复点 (decode 仅在主线程调用, 单实例安全)
+
+static void jpeg_error_exit_cb(j_common_ptr) {
+    longjmp(g_jpeg_jmp, 1);
+}
+
+class JpegDecoderNV12 {
+public:
+    bool init(int width, int height) {
+        width_ = width;
+        height_ = height;
+        cinfo_.err = jpeg_std_error(&jerr_);
+        jerr_.error_exit = jpeg_error_exit_cb;
+        jpeg_create_decompress(&cinfo_);
+        u_tmp_.resize((width_ / 2) * (height_ / 2));
+        v_tmp_.resize((width_ / 2) * (height_ / 2));
+        std::cout << "[DEC] libjpeg-turbo decoder ready: " << width_ << "x" << height_
+                  << " -> NV12" << std::endl;
+        return true;
+    }
+
+    // 解码一帧 MJPG -> NV12 写入 dst (需容纳 dst_stride*dst_vstride*3/2)
+    bool decode(const uint8_t* jpeg, size_t size, uint8_t* dst,
+                size_t dst_stride, size_t dst_vstride) {
+        if (!jpeg || !dst || size == 0) return false;
+        if (setjmp(g_jpeg_jmp) != 0) {
+            // libjpeg 错误: 重置状态机, 跳过该帧
+            jpeg_abort(reinterpret_cast<j_common_ptr>(&cinfo_));
+            ++fail_;
+            return false;
+        }
+
+        jpeg_mem_src(&cinfo_, const_cast<uint8_t*>(jpeg), size);
+        if (jpeg_read_header(&cinfo_, TRUE) != JPEG_HEADER_OK) {
+            jpeg_abort(reinterpret_cast<j_common_ptr>(&cinfo_));
+            ++fail_;
+            return false;
+        }
+        if ((int)cinfo_.image_width != width_ || (int)cinfo_.image_height != height_) {
+            // 分辨率不符 (摄像头输出异常帧), 跳过
+            jpeg_abort(reinterpret_cast<j_common_ptr>(&cinfo_));
+            ++fail_;
+            return false;
+        }
+
+        cinfo_.raw_data_out = TRUE;   // raw 模式: 直接输出 Y/U/V 平面, 无色彩转换
+        jpeg_start_decompress(&cinfo_);
+
+        // 逐 16 行 MCU 块解码 (4:2:0: 每 16 行 Y 对应 8 行 U/V)
+        // Y 行直接指向编码器输入 buffer (stride=dst_stride), U/V 到临时平面
+        const size_t cw = width_ / 2;
+        while (cinfo_.output_scanline < cinfo_.image_height) {
+            const size_t base = cinfo_.output_scanline;
+            JSAMPROW yrows[16], urows[8], vrows[8];
+            for (int r = 0; r < 16; ++r) {
+                yrows[r] = dst + (base + (size_t)r) * dst_stride;
+            }
+            for (int r = 0; r < 8; ++r) {
+                urows[r] = u_tmp_.data() + (base / 2 + (size_t)r) * cw;
+                vrows[r] = v_tmp_.data() + (base / 2 + (size_t)r) * cw;
+            }
+            JSAMPARRAY planes[3] = { yrows, urows, vrows };
+            jpeg_read_raw_data(&cinfo_, planes, 16);
+        }
+        jpeg_finish_decompress(&cinfo_);
+
+        // U/V 平面交织 -> NV12 UV 平面 (紧接 Y 平面之后)
+        uint8_t* uv = dst + dst_stride * dst_vstride;
+        for (int r = 0; r < height_ / 2; ++r) {
+            const uint8_t* u = u_tmp_.data() + (size_t)r * cw;
+            const uint8_t* v = v_tmp_.data() + (size_t)r * cw;
+            uint8_t* d = uv + (size_t)r * dst_stride;
+            for (size_t c = 0; c < cw; ++c) {
+                d[2 * c]      = u[c];
+                d[2 * c + 1]  = v[c];
+            }
+        }
+
+        // 每 150 帧 (约 5s @30fps) 打印一次计数, 确认解码数据流健康
+        if (++ok_ % 150 == 0) {
+            std::cout << "[DEC] decoded " << ok_ << " frames (fail " << fail_ << ")" << std::endl;
+        }
+        return true;
+    }
+
+    ~JpegDecoderNV12() {
+        jpeg_destroy_decompress(&cinfo_);
+    }
+
+private:
+    jpeg_decompress_struct cinfo_{};
+    jpeg_error_mgr jerr_{};
+    int width_ = 0, height_ = 0;
+    std::vector<uint8_t> u_tmp_, v_tmp_;   // I420 U/V 临时平面
+    uint64_t ok_ = 0, fail_ = 0;           // 解码成功/失败帧计数 (诊断用)
+};
+
+// ----------------------------------------------------------------------------
+// RK MPP 硬编码器 (H.264, Annex-B 输出, 输入 NV12/YUV420SP)
 // ----------------------------------------------------------------------------
 class MppEncoder {
 public:
@@ -302,6 +460,10 @@ public:
         mpp_enc_cfg_set_s32(cfg, "rc:bps_target", (RK_S32)bitrate);
         mpp_enc_cfg_set_s32(cfg, "rc:bps_max", (RK_S32)bitrate);
         mpp_enc_cfg_set_s32(cfg, "rc:bps_min", (RK_S32)bitrate);
+        // 限制量化步长: 保证 CBR 下静止/低运动场景保留细节, 并控制最差画质下限
+        mpp_enc_cfg_set_s32(cfg, "rc:qp_init", 26);
+        mpp_enc_cfg_set_s32(cfg, "rc:qp_min", 18);
+        mpp_enc_cfg_set_s32(cfg, "rc:qp_max", 42);
         mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
         mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps_);
         mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
@@ -333,11 +495,10 @@ public:
 
     uint32_t currentBitrate() const { return current_bitrate_; }
 
-    // 编码一帧 YUYV, 输出 Annex-B H.264 数据, 通过 onPacket 回调
+    // 编码当前 enc_buf_ 中的 NV12 帧 (由解码器直接写入, 零拷贝),
+    // 输出 Annex-B H.264 数据, 通过 onPacket 回调
     // 返回 false 表示失败 (程序应退出)
-    bool encode(const uint8_t* yuyv, size_t yuyv_size,
-                const std::function<void(const uint8_t*, size_t)>& on_packet) {
-        (void)yuyv_size;
+    bool encodeInput(const std::function<void(const uint8_t*, size_t)>& on_packet) {
         MppFrame frame = nullptr;
         mpp_frame_init(&frame);
         mpp_frame_set_width(frame, width_);
@@ -347,31 +508,6 @@ public:
         mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
         mpp_frame_set_eos(frame, 0);
         mpp_frame_set_pts(frame, pts_++);
-
-        // 软件 YUYV -> NV12 转换 (写入复用缓冲区)
-        // YUYV: [Y0 U0 Y1 V1 | Y2 U2 Y3 V3 | ...] 每行 src_stride 字节
-        // NV12: Y 平面(hs*vs) + UV 交错平面(hs*vs/2), 4:2:0 (垂直方向色度减半取平均)
-        uint8_t* y_plane  = static_cast<uint8_t*>(mpp_buffer_get_ptr(enc_buf_));
-        uint8_t* uv_plane = y_plane + hor_stride_ * ver_stride_;
-        const size_t src_stride = src_stride_ ? src_stride_ : width_ * 2;
-
-        for (int r = 0; r < height_; ++r) {
-            const uint8_t* s = yuyv + r * src_stride;
-            uint8_t* d = y_plane + r * hor_stride_;
-            for (int c = 0; c < width_; c += 2) {
-                d[c]     = s[2 * c];      // Y(偶像素)
-                d[c + 1] = s[2 * c + 2];  // Y(奇像素)
-            }
-        }
-        for (int r = 0; r < height_; r += 2) {
-            const uint8_t* s0 = yuyv +  r      * src_stride;  // 偶数行
-            const uint8_t* s1 = yuyv + (r + 1) * src_stride;  // 奇数行
-            uint8_t* duv = uv_plane + (r / 2) * hor_stride_;
-            for (int c = 0; c < width_; c += 2) {
-                duv[c]     = static_cast<uint8_t>((s0[2 * c + 1] + s1[2 * c + 1]) / 2);  // U
-                duv[c + 1] = static_cast<uint8_t>((s0[2 * c + 3] + s1[2 * c + 3]) / 2);  // V
-            }
-        }
 
         mpp_frame_set_buffer(frame, enc_buf_);
         if (mpi_->encode_put_frame(ctx_, frame) != MPP_OK) {
@@ -392,6 +528,12 @@ public:
         }
         return true;
     }
+
+    // 输入 NV12 缓冲区访问器 (供解码器直接写入, 实现零拷贝)
+    uint8_t* inputPtr() { return static_cast<uint8_t*>(mpp_buffer_get_ptr(enc_buf_)); }
+    size_t frameSize() const { return frame_size_; }
+    int horStride() const { return hor_stride_; }
+    int verStride() const { return ver_stride_; }
 
     // 发送 EOS 并排空剩余 packet (退出前调用, 释放 MPP 内部 buffer)
     void flush(const std::function<void(const uint8_t*, size_t)>& on_packet) {
@@ -427,9 +569,6 @@ public:
         }
     }
 
-    // 设置源 YUYV 数据的行字节跨度 (V4L2 bytesperline)
-    void set_src_stride(size_t s) { src_stride_ = s; }
-
     ~MppEncoder() {
         if (ctx_) {
             mpi_->reset(ctx_);
@@ -448,7 +587,6 @@ private:
     int hor_stride_ = 0, ver_stride_ = 0;
     int fps_ = 30;
     uint32_t current_bitrate_ = 0;
-    size_t src_stride_ = 0;   // 源 YUYV 行字节跨度
     size_t frame_size_ = 0;
     int64_t pts_ = 0;
 };
@@ -775,22 +913,31 @@ int main() {
     std::signal(SIGINT, [](int) { g_running = false; });
     std::signal(SIGTERM, [](int) { g_running = false; });
 
-    // 1. 初始化摄像头
+    // 1. 初始化摄像头 (MJPG 720p 采集)
     V4L2Capture capture;
-    if (!capture.init(CAM_DEV, WIDTH, HEIGHT)) {
+    if (!capture.init(CAM_DEV, WIDTH, HEIGHT, V4L2_PIX_FMT_MJPEG, FPS)) {
         std::cerr << "camera init failed, exit" << std::endl;
         rtc::Cleanup();
         return 1;
     }
+    // 画质控件调优: 锐度/gamma(暗部)/增益(低光)/对比度/色彩
+    capture.apply_ctrls();
 
-    // 2. 初始化 MPP 编码器 (NV12 输入, 软件转换自 YUYV)
+    // 1.5 初始化 MJPG 解码器 (libjpeg-turbo 软解 -> NV12)
+    JpegDecoderNV12 decoder;
+    if (!decoder.init(WIDTH, HEIGHT)) {
+        std::cerr << "decoder init failed, exit" << std::endl;
+        rtc::Cleanup();
+        return 1;
+    }
+
+    // 2. 初始化 MPP 编码器 (NV12 输入, 与解码器零拷贝直连)
     MppEncoder encoder;
     if (!encoder.init(WIDTH, HEIGHT, FPS, BITRATE)) {
         std::cerr << "encoder init failed, exit" << std::endl;
         rtc::Cleanup();
         return 1;
     }
-    encoder.set_src_stride(capture.row_stride());  // 摄像头 YUYV 实际行跨度
 
     // 3. 初始化 WebRTC + 信令
     WebRTCStreamer streamer;
@@ -851,7 +998,14 @@ int main() {
             continue;
         }
 
-        if (!encoder.encode(frame_data, frame_size,
+        // MJPG 软解 -> NV12 直接写入编码器输入缓冲 (零拷贝) -> H.264 硬编码
+        if (!decoder.decode(frame_data, frame_size, encoder.inputPtr(),
+                            encoder.horStride(), encoder.verStride())) {
+            // 单帧解码失败(如帧损坏)跳过, 不影响整体
+            capture.requeue();
+            continue;
+        }
+        if (!encoder.encodeInput(
                             [&streamer](const uint8_t* h264, size_t len) {
                                 streamer.send(h264, len);
                             })) {
