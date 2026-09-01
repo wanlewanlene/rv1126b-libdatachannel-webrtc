@@ -15,8 +15,8 @@ def brun(cmd, title, timeout=60):
     if err: print("[STDERR]", err.rstrip())
     return out
 
-# 完整 ADC 相关控件 (PGA/数字增益/HPF)
-brun("amixer -c 0 scontrols 2>&1 | grep -i 'ACodec_LP' ; echo '== HPF 选项 =='; amixer -c 0 sget 'ACodec_LP HPF' 2>&1 | tail -4; amixer -c 0 sget 'ACodec_LP HPF Cutoff' 2>&1 | tail -4; echo '== 当前增益 =='; amixer -c 0 sget 'ACodec_LP Digital Gain' 2>&1 | grep Mono; amixer -c 0 sget 'ACodec_LP PGA Gain' 2>&1 | grep Mono", "音频控件详情", 20)
+# 降噪库可用性: speexdsp / rnnoise / webrtc-audio?
+brun("dpkg -l 2>/dev/null | grep -iE 'speex|rnnoise|webrtc-audio' | head -6; echo '--- 库文件 ---'; ls /usr/lib/aarch64-linux-gnu/libspeex* /usr/lib/aarch64-linux-gnu/librnnoise* 2>/dev/null; echo '--- 头文件 ---'; ls /usr/include/speex/ /usr/include/rnnoise.h 2>/dev/null; echo '--- apt 候选 ---'; apt-cache policy libspeexdsp-dev rnnoise 2>/dev/null | grep -A2 '^libspeexdsp-dev\\|^rnnoise' | head -12", "降噪库探测", 30)
 
 board.close()
 print("\n===== 完成 =====")
