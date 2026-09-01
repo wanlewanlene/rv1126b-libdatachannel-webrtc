@@ -8,8 +8,11 @@ export LD_LIBRARY_PATH=/userdata/rtc/lib:$LD_LIBRARY_PATH
 echo elf | sudo -S ip route del default via 192.168.0.1 dev eth0 2>/dev/null || true
 
 # 音频增益固化: 板载 MIC 数字/模拟增益 (防板卡重启后恢复默认 -95dB 导致音量过小)
-amixer -c 0 sset 'ACodec_LP Digital Gain' 110 >/dev/null 2>&1
-amixer -c 0 sset 'ACodec_LP PGA Gain' 100% >/dev/null 2>&1
+# PGA 84% + Digital 75% + HPF 60Hz 开启: 音量足够且滤除低频交流底噪(杂音)
+amixer -c 0 sset 'ACodec_LP Digital Gain' 95 >/dev/null 2>&1
+amixer -c 0 sset 'ACodec_LP PGA Gain' 85% >/dev/null 2>&1
+amixer -c 0 sset 'ACodec_LP HPF' on >/dev/null 2>&1
+amixer -c 0 sset 'ACodec_LP HPF Cutoff' '60Hz' >/dev/null 2>&1
 
 # 本机 TURN 服务器 (低延迟中继): 浏览器同网段直连板卡 3478,
 # 避免走公网 srflx NAT 回环 (700ms 高延迟不稳定 -> 毫秒级本机回环)
