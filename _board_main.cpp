@@ -16,6 +16,7 @@
 
 #include <alsa/asoundlib.h>   // ALSA 音频采集 (板载 MIC)
 #include <opus/opus.h>        // Opus 音频编码 (WebRTC 标准音频编解码)
+#include <speex/speex_preprocess.h>  // SpeexDSP 实时降噪 + AGC
 
 #include <atomic>
 #include <chrono>
@@ -526,6 +527,60 @@ private:
 };
 
 // ----------------------------------------------------------------------------
+// SpeexDSP 实时降噪 + AGC (板载 MIC 底噪/交流声抑制)
+// 立体声交错 S16_LE 输入: 左右声道各一个 preprocess 实例, 就地处理
+// ----------------------------------------------------------------------------
+class SpeexNoiseReducer {
+public:
+    bool init(int rate, int frame_samples) {
+        st_l_ = speex_preprocess_state_init(frame_samples, rate);
+        st_r_ = speex_preprocess_state_init(frame_samples, rate);
+        if (!st_l_ || !st_r_) return false;
+
+        // 降噪强度 0~30 (约 -1~-30 dB 抑制量), 18 为较激进但保音质
+        int denoise = 18;
+        speex_preprocess_ctl(st_l_, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &denoise);
+        speex_preprocess_ctl(st_r_, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &denoise);
+        // 自动增益: 稳定输出电平, 防止降噪后音量忽大忽小
+        int agc = 1;
+        speex_preprocess_ctl(st_l_, SPEEX_PREPROCESS_SET_AGC, &agc);
+        speex_preprocess_ctl(st_r_, SPEEX_PREPROCESS_SET_AGC, &agc);
+        int level = 8000;   // AGC 目标电平 (0~32767)
+        speex_preprocess_ctl(st_l_, SPEEX_PREPROCESS_SET_AGC_LEVEL, &level);
+        speex_preprocess_ctl(st_r_, SPEEX_PREPROCESS_SET_AGC_LEVEL, &level);
+
+        l_.resize(frame_samples);
+        r_.resize(frame_samples);
+        std::cout << "[AUDIO] speex denoise enabled (NS " << denoise << "dB, AGC on)" << std::endl;
+        return true;
+    }
+
+    // 就地处理一帧交错立体声 S16_LE
+    void process(int16_t* interleaved, int frames) {
+        for (int i = 0; i < frames; ++i) {
+            l_[i] = interleaved[2 * i];
+            r_[i] = interleaved[2 * i + 1];
+        }
+        speex_preprocess_run(st_l_, l_.data());
+        speex_preprocess_run(st_r_, r_.data());
+        for (int i = 0; i < frames; ++i) {
+            interleaved[2 * i]     = l_[i];
+            interleaved[2 * i + 1] = r_[i];
+        }
+    }
+
+    ~SpeexNoiseReducer() {
+        if (st_l_) speex_preprocess_state_destroy(st_l_);
+        if (st_r_) speex_preprocess_state_destroy(st_r_);
+    }
+
+private:
+    SpeexPreprocessState* st_l_ = nullptr;
+    SpeexPreprocessState* st_r_ = nullptr;
+    std::vector<int16_t> l_, r_;
+};
+
+// ----------------------------------------------------------------------------
 // Opus 编码器封装 (PCM S16_LE -> Opus 帧)
 // ----------------------------------------------------------------------------
 class OpusEncoderWrap {
@@ -797,13 +852,15 @@ int main() {
     streamer.setAdjustHandler([&encoder](uint32_t bps) { encoder.setBitrate(bps); });
     streamer.start(SIGNALING_URL, ROOM);
 
-    // 3.5 初始化音频: ALSA 采集 + Opus 编码, 在独立线程中运行 (与视频共用 start_time_ 时钟)
+    // 3.5 初始化音频: ALSA 采集 -> SpeexDSP 降噪 -> Opus 编码, 独立线程 (与视频共用 start_time_ 时钟)
     AlsaCapture audio_cap;
     OpusEncoderWrap opus_enc;
+    SpeexNoiseReducer noise_reducer;
     std::thread audio_thread;
     const int audio_frame_samples = AUDIO_RATE * AUDIO_FRAME_MS / 1000;  // 960 样本 (20ms)
     if (audio_cap.init(AUDIO_DEV, AUDIO_RATE, AUDIO_CHANNELS, audio_frame_samples) &&
-        opus_enc.init(AUDIO_RATE, AUDIO_CHANNELS, AUDIO_BITRATE)) {
+        opus_enc.init(AUDIO_RATE, AUDIO_CHANNELS, AUDIO_BITRATE) &&
+        noise_reducer.init(AUDIO_RATE, audio_frame_samples)) {
         audio_thread = std::thread([&]() {
             std::vector<int16_t> pcm(audio_frame_samples * AUDIO_CHANNELS);
             std::vector<uint8_t> opus_buf(1500);  // Opus 帧最大 < 1275 字节
@@ -821,6 +878,9 @@ int main() {
                     got += n;
                 }
                 if (got <= 0) continue;
+
+                // SpeexDSP 实时降噪 + AGC (就地处理交错立体声)
+                noise_reducer.process(pcm.data(), got);
 
                 int bytes = opus_enc.encode(pcm.data(), got, opus_buf.data(),
                                             static_cast<int>(opus_buf.size()));
