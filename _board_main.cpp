@@ -538,20 +538,16 @@ public:
         if (!st_l_ || !st_r_) return false;
 
         // 降噪强度 0~30 (约 -1~-30 dB 抑制量), 18 为较激进但保音质
+        // NOTE: 禁用 AGC! libspeexdsp 1.2.1 在 48kHz 下开启 AGC 实测输出全静音
+        // (RMS->0, 库缺陷); 音量交由 ALSA mixer 增益控制 (Digital 95/PGA 84%)
         int denoise = 18;
         speex_preprocess_ctl(st_l_, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &denoise);
         speex_preprocess_ctl(st_r_, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &denoise);
-        // 自动增益: 稳定输出电平, 防止降噪后音量忽大忽小
-        int agc = 1;
-        speex_preprocess_ctl(st_l_, SPEEX_PREPROCESS_SET_AGC, &agc);
-        speex_preprocess_ctl(st_r_, SPEEX_PREPROCESS_SET_AGC, &agc);
-        int level = 8000;   // AGC 目标电平 (0~32767)
-        speex_preprocess_ctl(st_l_, SPEEX_PREPROCESS_SET_AGC_LEVEL, &level);
-        speex_preprocess_ctl(st_r_, SPEEX_PREPROCESS_SET_AGC_LEVEL, &level);
 
         l_.resize(frame_samples);
         r_.resize(frame_samples);
-        std::cout << "[AUDIO] speex denoise enabled (NS " << denoise << "dB, AGC on)" << std::endl;
+        std::cout << "[AUDIO] speex denoise enabled (NS " << denoise << "dB, AGC disabled 48k-bug)"
+                  << std::endl;
         return true;
     }
 
