@@ -18,3 +18,5 @@ _backup_*/
 *.so
 _probe_out.txt
 node_modules/
+__pycache__/
+*.pyc
