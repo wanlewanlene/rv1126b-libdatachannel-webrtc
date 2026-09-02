@@ -13,12 +13,9 @@ def brun(cmd, title, timeout=60):
     out = stdout.read().decode(errors='replace'); err = stderr.read().decode(errors='replace')
     if out: print(out.rstrip())
     if err: print("[STDERR]", err.rstrip())
+    return out
 
-sftp = board.open_sftp()
-sftp.put(r'c:\Users\zyp\Desktop\3\rv1106\Browser_client.html', '/userdata/rtc/server/Browser_client.html')
-sftp.close()
-brun("md5sum /userdata/rtc/server/Browser_client.html; grep -c 'restartBtn' /userdata/rtc/server/Browser_client.html", "上传页面", 20)
-brun("curl -s -o /dev/null -w 'HTTP %{http_code}' http://127.0.0.1:3000/ ; echo ''", "页面可访问性", 20)
+brun("echo '== 信令 =='; pgrep -af '[W]ebSocket.js' | grep -v bash || echo '(未运行)'; echo '== 推流 =='; pgrep -af '[r]v1126b_webrtc_push' | grep -v bash || echo '(未运行)'; echo '== TURN =='; pgrep -af '[t]urnserver' | grep -v bash || echo '(未运行)'; echo '== 端口 =='; sudo ss -tlnp | grep -E ':3000|:8080' || echo '(3000/8080 未监听)'", "服务状态", 20)
 
 board.close()
 print("\n===== 完成 =====")

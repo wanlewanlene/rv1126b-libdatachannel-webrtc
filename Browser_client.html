@@ -29,6 +29,10 @@
         }
         .toolbar button:hover { background: #3d7bf5; }
         .toolbar button:disabled { background: #3a414b; cursor: not-allowed; }
+        /* 重启推流按钮: 警示色区分, 用于刷新页面后手动恢复连接 */
+        #restartBtn { background: #b26a00; }
+        #restartBtn:hover { background: #d18217; }
+        #restartBtn:disabled { background: #3a414b; }
         #status {
             margin-left: auto; font-size: 13px; color: #8b949e; padding: 6px 10px;
             background: #0f1115; border-radius: 6px; border: 1px solid #2c313a;
@@ -74,6 +78,7 @@
         <label>房间</label>
         <input id="roomInput" type="text" value="cam1">
         <button id="connectBtn">连接</button>
+        <button id="restartBtn">重启推流</button>
         <button id="muteBtn" disabled>静音</button>
         <span id="status">未连接</span>
     </div>
@@ -224,11 +229,18 @@
             const room = roomInput.value.trim() || 'cam1';
             const wsUrl = getWsUrl();
 
-            // 清理旧连接
-            if (ws) { ws.close(); ws = null; }
-            if (pc) { pc.close(); pc = null; }
-            video.srcObject = null;
-            audio.srcObject = null;
+            // 清理旧连接 (彻底释放, 支持多次重连/重启)
+            if (ws) { ws.onmessage = null; ws.onclose = null; ws.close(); ws = null; }
+            if (pc) { pc.onicecandidate = null; pc.onconnectionstatechange = null;
+                      pc.ontrack = null; pc.close(); pc = null; }
+            if (video.srcObject) {
+                try { video.srcObject.getTracks().forEach(t => t.stop()); } catch (e) {}
+                video.srcObject = null;
+            }
+            if (audio.srcObject) {
+                try { audio.srcObject.getTracks().forEach(t => t.stop()); } catch (e) {}
+                audio.srcObject = null;
+            }
             muteBtn.disabled = true;
 
             // 重置监测面板与自适应状态
@@ -333,6 +345,14 @@
         }
 
         connectBtn.addEventListener('click', connect);
+
+        // 重启推流: 彻底重置连接并重新加入房间 (刷新页面后手动恢复用)
+        // 复用 connect() 的完整清理+重建流程 (关闭 WS/PC、停流、重新 viewer_join)
+        const restartBtn = document.getElementById('restartBtn');
+        restartBtn.addEventListener('click', () => {
+            setStatus('正在重启推流连接...');
+            connect();
+        });
 
         // 页面加载时若通过 http 访问且 hostname 非 localhost, 自动用 hostname; 否则用默认 IP
         window.addEventListener('DOMContentLoaded', () => {
