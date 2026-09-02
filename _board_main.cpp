@@ -616,87 +616,14 @@ class WebRTCStreamer {
 public:
     bool start(const std::string& signaling_url, const std::string& room) {
         room_ = room;
-        rtc::Configuration config;
-        config.iceServers.emplace_back(STUN_SERVER);
-        pc_ = std::make_shared<rtc::PeerConnection>(config);
-
-        // 创建 H.264 视频 track (SendOnly)
-        rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
-        video.addH264Codec(96);
-        video.addSSRC(42, std::string("video-send"), std::string("stream1"), std::string("video"));
-
-        track_ = pc_->addTrack(video);
-
-        // RTP 打包配置 (SSRC/payloadType/时钟频率必须与 SDP 一致)
-        // 注意: rtpConfig 不能为 nullptr, 否则连接建立后发送首帧即空指针崩溃
-        rtpConfig_ = std::make_shared<rtc::RtpPacketizationConfig>(
-            42, "video-send", 96, 90000);
-
-        auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
-            rtc::NalUnit::Separator::LongStartSequence, rtpConfig_);
-        // RTCP SR 定期上报 (浏览器依赖 SR 做 RTT/带宽估计, 缺失会导致 stats 异常)
-        packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(rtpConfig_));
-        // 响应浏览器 NACK 丢包重传请求 (防止花屏/卡顿)
-        packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
-        // 响应浏览器 PLI/FIR 关键帧请求 (快速出画面/丢包后快速恢复)
-        packetizer->addToChain(std::make_shared<rtc::PliHandler>([]() {
-            g_request_idr = true;
-        }));
-        track_->setMediaHandler(packetizer);
-
-        // 创建 Opus 音频 track (SendOnly) —— 与视频共用 msid="stream1" 以便浏览器音视频同步
-        rtc::Description::Audio audio("audio", rtc::Description::Direction::SendOnly);
-        audio.addOpusCodec(AUDIO_PAYLOAD_TYPE);  // Opus, 默认 profile: minptime=10;stereo=1;useinbandfec=1
-        audio.addSSRC(43, std::string("audio-send"), std::string("stream1"), std::string("audio"));
-
-        audio_track_ = pc_->addTrack(audio);
-
-        audio_rtp_config_ = std::make_shared<rtc::RtpPacketizationConfig>(
-            43, "audio-send", AUDIO_PAYLOAD_TYPE, 48000);  // Opus RTP 时钟 48kHz
-        auto audio_packetizer = std::make_shared<rtc::OpusRtpPacketizer>(audio_rtp_config_);
-        // RTCP SR 上报: 音频与视频共用同一 start_time_ 时钟源, 浏览器据此将 RTP 时间戳
-        // 对齐到同一 NTP 时间轴, 实现唇音同步 (lip-sync)
-        audio_packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(audio_rtp_config_));
-        audio_track_->setMediaHandler(audio_packetizer);
-
         ws_ = std::make_shared<rtc::WebSocket>();
-
-        pc_->onLocalDescription([this](rtc::Description desc) {
-            local_sdp_ = desc.generateSdp();
-            send_offer();
-            std::cout << "[SIG] offer sent (" << local_sdp_.size() << " bytes)" << std::endl;
-        });
-
-        pc_->onLocalCandidate([this](rtc::Candidate cand) {
-            std::string msg = "{\"type\":\"ice\",\"room\":\"" + room_ +
-                              "\",\"candidate\":\"" + json_escape(cand.candidate()) +
-                              "\",\"mid\":\"" + json_escape(cand.mid()) + "\"}";
-            send_msg(msg);
-        });
-
-        pc_->onStateChange([this](rtc::PeerConnection::State state) {
-            std::cout << "[RTC] state: " << static_cast<int>(state) << std::endl;
-            if (state == rtc::PeerConnection::State::Connected) {
-                connected_ = true;
-                g_request_idr = true;  // 连接建立立即输出关键帧, 浏览器尽快出画面
-                std::cout << "[RTC] ===== CONNECTED =====" << std::endl;
-            } else if (state == rtc::PeerConnection::State::Disconnected ||
-                       state == rtc::PeerConnection::State::Failed ||
-                       state == rtc::PeerConnection::State::Closed) {
-                connected_ = false;    // 断线后停止发送, 防止向已失效的 track 发数据
-            }
-        });
-
-        pc_->onGatheringStateChange([](rtc::PeerConnection::GatheringState state) {
-            std::cout << "[RTC] gathering state: " << static_cast<int>(state) << std::endl;
-        });
 
         ws_->onOpen([this]() {
             std::cout << "[SIG] websocket connected" << std::endl;
             std::string msg = "{\"type\":\"streamer_join\",\"room\":\"" + room_ + "\"}";
             send_msg(msg);
-            // 加入后生成本地 offer (触发 onLocalDescription)
-            pc_->setLocalDescription();
+            // 加入房间后创建全新 PeerConnection (触发 onLocalDescription 发送 offer)
+            createPeerConnection();
         });
 
         ws_->onMessage([this](rtc::message_variant data) {
@@ -753,6 +680,105 @@ public:
     bool connected() const { return connected_; }
 
 private:
+    // 创建/重建全新 PeerConnection (新 ICE 凭据 + 新 offer)
+    // viewer 每次加入 (request_offer) 都重建: libdatachannel 0.24 在首次
+    // offer/answer 完成后处于 stable 状态, 直接接受新 answer 会报
+    // "Unexpected remote answer description in signaling state stable",
+    // 且该版本无 renegotiate() API, 故以销毁重建实现"多 viewer 轮流观看"
+    void createPeerConnection() {
+        connected_ = false;
+        // 关闭并释放旧会话 (触发旧回调 Closed -> connected_ = false)
+        if (pc_) {
+            try { pc_->close(); } catch (const std::exception& e) {
+                std::cerr << "[RTC] old pc close: " << e.what() << std::endl;
+            }
+            pc_ = nullptr;
+        }
+        track_ = nullptr;
+        audio_track_ = nullptr;
+
+        rtc::Configuration config;
+        config.iceServers.emplace_back(STUN_SERVER);
+        pc_ = std::make_shared<rtc::PeerConnection>(config);
+
+        // 创建 H.264 视频 track (SendOnly)
+        rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
+        video.addH264Codec(96);
+        video.addSSRC(42, std::string("video-send"), std::string("stream1"), std::string("video"));
+
+        track_ = pc_->addTrack(video);
+
+        // RTP 打包配置 (SSRC/payloadType/时钟频率必须与 SDP 一致)
+        // 注意: rtpConfig 不能为 nullptr, 否则连接建立后发送首帧即空指针崩溃
+        rtpConfig_ = std::make_shared<rtc::RtpPacketizationConfig>(
+            42, "video-send", 96, 90000);
+
+        auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
+            rtc::NalUnit::Separator::LongStartSequence, rtpConfig_);
+        // RTCP SR 定期上报 (浏览器依赖 SR 做 RTT/带宽估计, 缺失会导致 stats 异常)
+        packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(rtpConfig_));
+        // 响应浏览器 NACK 丢包重传请求 (防止花屏/卡顿)
+        packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+        // 响应浏览器 PLI/FIR 关键帧请求 (快速出画面/丢包后快速恢复)
+        packetizer->addToChain(std::make_shared<rtc::PliHandler>([]() {
+            g_request_idr = true;
+        }));
+        track_->setMediaHandler(packetizer);
+
+        // 创建 Opus 音频 track (SendOnly) —— 与视频共用 msid="stream1" 以便浏览器音视频同步
+        rtc::Description::Audio audio("audio", rtc::Description::Direction::SendOnly);
+        audio.addOpusCodec(AUDIO_PAYLOAD_TYPE);  // Opus, 默认 profile: minptime=10;stereo=1;useinbandfec=1
+        audio.addSSRC(43, std::string("audio-send"), std::string("stream1"), std::string("audio"));
+
+        audio_track_ = pc_->addTrack(audio);
+
+        audio_rtp_config_ = std::make_shared<rtc::RtpPacketizationConfig>(
+            43, "audio-send", AUDIO_PAYLOAD_TYPE, 48000);  // Opus RTP 时钟 48kHz
+        auto audio_packetizer = std::make_shared<rtc::OpusRtpPacketizer>(audio_rtp_config_);
+        // RTCP SR 上报: 音频与视频共用同一 start_time_ 时钟源, 浏览器据此将 RTP 时间戳
+        // 对齐到同一 NTP 时间轴, 实现唇音同步 (lip-sync)
+        audio_packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(audio_rtp_config_));
+        audio_track_->setMediaHandler(audio_packetizer);
+
+        // 回调绑定 (重建时对新实例重新注册)
+        pc_->onLocalDescription([this](rtc::Description desc) {
+            local_sdp_ = desc.generateSdp();
+            // 直接发送, 仅一次 (旧实现经 send_offer() 双重打印, 双 offer 有竞态风险)
+            std::string msg = "{\"type\":\"offer\",\"room\":\"" + room_ +
+                              "\",\"sdp\":\"" + json_escape(local_sdp_) + "\"}";
+            send_msg(msg);
+            std::cout << "[SIG] offer sent (" << local_sdp_.size() << " bytes)" << std::endl;
+        });
+
+        pc_->onLocalCandidate([this](rtc::Candidate cand) {
+            std::string msg = "{\"type\":\"ice\",\"room\":\"" + room_ +
+                              "\",\"candidate\":\"" + json_escape(cand.candidate()) +
+                              "\",\"mid\":\"" + json_escape(cand.mid()) + "\"}";
+            send_msg(msg);
+        });
+
+        pc_->onStateChange([this](rtc::PeerConnection::State state) {
+            std::cout << "[RTC] state: " << static_cast<int>(state) << std::endl;
+            if (state == rtc::PeerConnection::State::Connected) {
+                connected_ = true;
+                g_request_idr = true;  // 连接建立立即输出关键帧, 浏览器尽快出画面
+                std::cout << "[RTC] ===== CONNECTED =====" << std::endl;
+            } else if (state == rtc::PeerConnection::State::Disconnected ||
+                       state == rtc::PeerConnection::State::Failed ||
+                       state == rtc::PeerConnection::State::Closed) {
+                connected_ = false;    // 断线后停止发送, 防止向已失效的 track 发数据
+            }
+        });
+
+        pc_->onGatheringStateChange([](rtc::PeerConnection::GatheringState state) {
+            std::cout << "[RTC] gathering state: " << static_cast<int>(state) << std::endl;
+        });
+
+        // 生成本地 offer (触发 onLocalDescription -> 发送给 viewer)
+        pc_->setLocalDescription();
+    }
+
+private:
     void send_msg(const std::string& msg) {
         if (ws_ && ws_->isOpen()) ws_->send(msg);
     }
@@ -778,9 +804,11 @@ private:
                 pc_->addRemoteCandidate(cand);
             }
         } else if (type == "request_offer") {
-            // viewer 加入后请求重新发送 offer (重发缓存的 SDP)
-            std::cout << "[SIG] request_offer received, re-sending offer" << std::endl;
-            send_offer();
+            // viewer 加入/重连: 重建全新 PeerConnection (新 ICE 凭据 + 新 offer)
+            // 修复: 旧实现仅重发缓存 SDP, 板卡 stable 状态下无法接受新 answer
+            // ("Unexpected remote answer description"), 导致刷新页面后无法恢复画面
+            std::cout << "[SIG] request_offer received, rebuilding PeerConnection" << std::endl;
+            createPeerConnection();
         } else if (type == "adjust") {
             // 监测面板自动优化: 浏览器上报 FPS/延迟, 动态调整视频码率
             std::string bps_str = json_get_str(text, "bitrate");
