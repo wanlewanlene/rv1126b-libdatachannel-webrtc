@@ -1,224 +1,427 @@
 <!DOCTYPE html>
+
 <html lang="zh-CN">
+
 <head>
+
     <meta charset="UTF-8">
+
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
     <title>WebRTC 反向推流 - 浏览器 → 板卡</title>
+
     <style>
+
         * { box-sizing: border-box; margin: 0; padding: 0; }
+
         body {
+
             background: #14161a; color: #e6e8eb; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+
             display: flex; flex-direction: column; height: 100vh;
+
         }
+
         .toolbar {
+
             display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+
             background: #1e2228; border-bottom: 1px solid #2c313a; flex-wrap: wrap;
+
         }
+
         .toolbar label { font-size: 14px; color: #9aa3ad; white-space: nowrap; }
+
         .toolbar input {
+
             background: #0f1115; border: 1px solid #3a414b; color: #e6e8eb;
+
             border-radius: 6px; padding: 7px 10px; font-size: 14px; outline: none;
+
         }
+
         #ipInput { width: 160px; }
+
         #roomInput { width: 100px; }
+
         .toolbar button {
+
             border: none; color: #fff; padding: 8px 18px; border-radius: 6px;
+
             font-size: 14px; cursor: pointer; transition: background .15s;
+
         }
+
         #startBtn { background: #2f6fed; }
+
         #startBtn:hover { background: #3d7bf5; }
+
         #stopBtn { background: #c0392b; }
+
         #stopBtn:hover { background: #d54b3a; }
+
         .toolbar button:disabled { background: #3a414b; cursor: not-allowed; }
+
         #status {
+
             margin-left: auto; font-size: 13px; color: #8b949e; padding: 6px 10px;
+
             background: #0f1115; border-radius: 6px; border: 1px solid #2c313a;
+
         }
+
         #status.active { color: #3fb950; border-color: #2ea043; }
+
         #status.error { color: #f85149; border-color: #f85149; }
+
         .main {
+
             flex: 1; display: flex; gap: 16px; padding: 16px; align-items: center; justify-content: center; flex-wrap: wrap;
+
         }
+
         video {
+
             max-width: 45vw; max-height: 80vh; background: #000; border-radius: 8px;
+
             box-shadow: 0 4px 24px rgba(0,0,0,.5);
+
         }
+
         .hint {
+
             font-size: 13px; color: #8b949e; text-align: center; margin-top: 6px;
+
         }
+
     </style>
+
 </head>
+
 <body>
+
     <div class="toolbar">
+
         <label>板卡 IP</label>
+
         <input id="ipInput" type="text" value="192.168.137.184" placeholder="板卡IP">
+
         <label>端口</label>
+
         <input id="portInput" type="text" value="8080" style="width:60px">
+
         <label>房间</label>
+
         <input id="roomInput" type="text" value="reverse1">
+
         <button id="startBtn">开始推流</button>
+
+        <button id="restartBtn" disabled>重新推流</button>
+
         <button id="stopBtn" disabled>停止</button>
+
         <span id="status">未连接</span>
-    </div>
-    <div class="main">
-        <div>
-            <video id="localVideo" autoplay playsinline muted></video>
-            <div class="hint">本地预览（摄像头）</div>
-        </div>
+
     </div>
 
+    <div class="main">
+
+        <div>
+
+            <video id="localVideo" autoplay playsinline muted></video>
+
+            <div class="hint">本地预览（摄像头）</div>
+
+        </div>
+
+    </div>
+
+
+
     <script>
+
         const ipInput = document.getElementById('ipInput');
+
         const portInput = document.getElementById('portInput');
+
         const roomInput = document.getElementById('roomInput');
+
         const startBtn = document.getElementById('startBtn');
+
+        const restartBtn = document.getElementById('restartBtn');
+
         const stopBtn = document.getElementById('stopBtn');
+
         const statusEl = document.getElementById('status');
+
         const localVideo = document.getElementById('localVideo');
+
+
 
         let pc = null, ws = null, localStream = null;
 
+
+
         function setStatus(text, cls) {
+
             statusEl.textContent = text;
+
             statusEl.className = cls || '';
+
         }
+
+
 
         function getWsUrl() {
+
             return `ws://${ipInput.value.trim()}:${portInput.value.trim()}`;
+
         }
+
+
 
         function sendWs(obj) {
+
             if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+
         }
+
+
 
         function stopAll() {
+
             if (ws) { ws.onmessage = null; ws.close(); ws = null; }
+
             if (pc) { pc.onicecandidate = null; pc.onconnectionstatechange = null; pc.close(); pc = null; }
+
             if (localStream) {
+
                 localStream.getTracks().forEach(t => t.stop());
+
                 localStream = null;
+
             }
+
             localVideo.srcObject = null;
+
         }
+
+
 
         function setStatusMsg(t) {
+
             if (t.kind === 'video') {
+
                 setStatus('视频轨就绪(编码:' + t.track.label + ')', '');
+
             }
+
         }
+
+
 
         async function startPush() {
+
             stopAll();
+
             const room = roomInput.value.trim() || 'reverse1';
+
             setStatus('请求摄像头/麦克风...');
 
+
+
             // 1) 采集本地摄像头 + 麦克风 (音量类增强由浏览器自带回声消除/降噪)
+
             localStream = await navigator.mediaDevices.getUserMedia({
-                video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
+
+                video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+
                 audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+
             });
+
             localVideo.srcObject = localStream;
+
             localVideo.muted = true;
+
             setStatus('设备就绪, 建立连接...');
 
+
+
             // 2) PeerConnection: 视频优先 H.264 (板卡 mppvideodec 硬解), 音频 Opus
+
             pc = new RTCPeerConnection({
+
                 iceServers: [
+
                     { urls: 'stun:stun.l.google.com:19302' },
+
                     { urls: 'turn:' + (ipInput.value.trim() || '192.168.137.184') + ':3478', username: 'webrtc', credential: 'webrtc123' }
+
                 ]
+
             });
 
-            // 视频 transceiver (sendonly) + 编码偏好 H264 > VP8 > VP9
-            const vtr = pc.addTransceiver('video', { direction: 'sendonly' });
-            try {
-                const caps = RTCRtpSender.getCapabilities('video');
-                if (caps && vtr.setCodecPreferences) {
-                    const want = ['video/H264', 'video/VP8', 'video/VP9'];
-                    const codecs = [];
-                    for (const w of want) {
-                        for (const c of caps.codecs) {
-                            if (c.mimeType.toUpperCase() === w) codecs.push(c);
-                        }
-                    }
-                    if (codecs.length) vtr.setCodecPreferences(codecs);
-                }
-            } catch (e) { console.warn('codec preference:', e); }
 
-            // 音频 track
-            localStream.getAudioTracks().forEach(t => pc.addTrack(t, localStream));
-            // 视频: 用 transceiver 的 sender 绑定采集轨道
-            const vTrack = localStream.getVideoTracks()[0];
-            if (vTrack) await vtr.sender.replaceTrack(vTrack);
+
+            // 轨道直接挂连接 (浏览器自动创建 sendonly transceiver, 顺序: video, audio)
+            // 编解码无需本端偏好: 板卡 offer 仅声明 H264(96)/Opus(111), 应答时只能选它们
+            // 注意: Edge 上 addTransceiver+replaceTrack 组合存在方向协商缺陷 (answer 中
+            //       视频 m-line 降级为 a=inactive 不发流), 故统一使用 addTrack 原生绑定
+
+            localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+
 
             pc.onicecandidate = (e) => {
+
                 if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
-                    sendWs({ type: 'ice', room, candidate: e.candidate.candidate, mid: e.candidate.sdpMid });
+
+                    sendWs({ type: 'ice', room, candidate: e.candidate.candidate, mid: e.candidate.sdpMid, mline: e.candidate.sdpMLineIndex });
+
                 }
+
             };
+
             pc.onconnectionstatechange = () => {
+
                 if (pc.connectionState === 'connected') setStatus('已连接: 板卡正在接收播放', 'active');
+
                 else if (pc.connectionState === 'failed') setStatus('连接失败', 'error');
+
                 else if (pc.connectionState === 'disconnected') setStatus('连接断开', 'error');
+
             };
+
             pc.ontrack = setStatusMsg;
 
+
+
             // 3) 信令: 作为 streamer 加入 reverse 房间
+
             ws = new WebSocket(getWsUrl());
+
             ws.onopen = () => {
+
                 sendWs({ type: 'streamer_join', room });
+
                 setStatus('已连信令, 生成 offer...');
+
             };
+
             ws.onmessage = async (e) => {
+
                 let msg;
+
                 try { msg = JSON.parse(e.data); } catch (err) { return; }
-                if (msg.type === 'answer') {
-                    await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-                    setStatus('已收到 answer, 建立连接中...');
+
+                if (msg.type === 'offer') {
+
+                    // 反向推流: 板卡为 offerer, 浏览器为 answerer
+
+                    try {
+
+                        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+
+                        setStatus('已收到板卡 offer, 生成应答...');
+
+                        const answer = await pc.createAnswer();
+
+                        await pc.setLocalDescription(answer);
+
+                        sendWs({ type: 'answer', room, sdp: answer.sdp });
+
+                        setStatus('已发送 answer, 建立连接中...');
+
+                    } catch (err) { setStatus('应答失败: ' + err.message, 'error'); }
+
                 } else if (msg.type === 'ice') {
+
                     if (msg.candidate) {
+
                         try { await pc.addIceCandidate({ candidate: msg.candidate, sdpMid: msg.mid }); }
+
                         catch (err) { console.warn('addIceCandidate', err); }
+
                     }
+
                 }
+
             };
+
             ws.onerror = () => setStatus('信令连接错误', 'error');
+
             ws.onclose = () => { if (!pc || pc.connectionState !== 'connected') setStatus('信令断开', 'error'); };
 
-            // 4) 等待 WS 就绪后发 offer (需要 streamer_join 先完成, 稍等 onopen 后触发)
+
+
+            // 4) 请求板卡生成 offer (板卡为 offerer, 浏览器为 answerer)
+
             ws.onopen = () => {
+
                 sendWs({ type: 'streamer_join', room });
-                setStatus('已连信令, 生成 offer...');
-                setTimeout(async () => {
-                    try {
-                        const offer = await pc.createOffer();
-                        await pc.setLocalDescription(offer);
-                        sendWs({ type: 'offer', room, sdp: offer.sdp });
-                        setStatus('offer 已发送, 等待板卡应答...');
-                    } catch (err) { setStatus('offer 生成失败: ' + err.message, 'error'); }
-                }, 200);
+
+                setStatus('已连信令, 请求板卡 offer...');
+
+                setTimeout(() => {
+
+                    sendWs({ type: 'request_offer', room });
+
+                }, 300);
+
             };
 
+
+
             startBtn.disabled = true;
+
+            restartBtn.disabled = false;
+
             stopBtn.disabled = false;
+
         }
+
+
 
         function stopPush() {
+
             stopAll();
+
             setStatus('已停止');
+
             startBtn.disabled = false;
+
+            restartBtn.disabled = true;
+
             stopBtn.disabled = true;
+
         }
 
+
+
         startBtn.addEventListener('click', () => startPush().catch(e => setStatus('启动失败: ' + e.message, 'error')));
+
+        restartBtn.addEventListener('click', () => { stopPush(); setTimeout(() => startPush().catch(e => setStatus('启动失败: ' + e.message, 'error')), 300); });
+
         stopBtn.addEventListener('click', stopPush);
 
+
+
         window.addEventListener('DOMContentLoaded', () => {
+
             const hn = location.hostname;
+
             if (hn && hn !== 'localhost' && hn !== '127.0.0.1' && location.protocol.startsWith('http')) {
+
                 ipInput.value = hn;
+
             }
+
         });
+
     </script>
+
 </body>
+
 </html>
+

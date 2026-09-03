@@ -77,23 +77,43 @@ wss.on('connection', (ws) => {
                 break;
             }
             case 'offer': {
-                // 推流端 -> 所有播放端
+                // 正向推流: 推流端(streamer)的 offer -> 所有播放端(viewers)
+                // 反向推流: 板卡(viewer)的 offer -> 浏览器(streamer)
                 if (room) {
-                    console.log(`[offer] forwarding to ${room.viewers.size} viewers`);
-                    room.viewers.forEach((v) => send(v, msg));
+                    if (ws.role === 'viewer') {
+                        if (room.streamer) send(room.streamer, msg);
+                        console.log('[offer] viewer->streamer forwarded');
+                    } else {
+                        console.log(`[offer] forwarding to ${room.viewers.size} viewers`);
+                        room.viewers.forEach((v) => send(v, msg));
+                    }
                 } else {
                     console.log('[offer] no room!');
                 }
                 break;
             }
             case 'answer': {
-                // 播放端 -> 推流端
-                if (room && room.streamer) send(room.streamer, msg);
+                // 正向推流: 播放端(viewer)的 answer -> 推流端(streamer)
+                // 反向推流: 浏览器(streamer)的 answer -> 板卡(viewer)
+                if (room) {
+                    if (ws.role === 'streamer') {
+                        room.viewers.forEach((v) => send(v, msg));
+                        console.log('[answer] streamer->viewers forwarded');
+                    } else if (room.streamer) {
+                        send(room.streamer, msg);
+                        console.log('[answer] viewer->streamer forwarded');
+                    }
+                }
                 break;
             }
             case 'adjust': {
                 // 播放端 -> 推流端: 监测面板自动优化指令 (动态码率)
                 if (room && room.streamer) send(room.streamer, msg);
+                break;
+            }
+            case 'request_offer': {
+                // 反向推流: 浏览器(streamer)请求板卡(viewer)生成 offer
+                if (room) room.viewers.forEach((v) => send(v, msg));
                 break;
             }
             case 'ice': {
