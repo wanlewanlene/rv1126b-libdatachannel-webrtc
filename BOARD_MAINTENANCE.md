@@ -3,26 +3,25 @@
 > 2026-09-06 整理。记录反向推流功能涉及的所有板端系统级修改，供后续维护。
 > 板卡 IP 为 DHCP 动态（热点拓扑 192.168.137.184，路由器拓扑 192.168.2.x），SSH 用户 `elf` 密码 `elf`。
 
-## 一、服务与守护
+## 一、服务与守护（双 systemd 服务，已 enable）
 
-### reverse-player.service（systemd 守护，已 enable）
+### rtc-signal.service（信令）
+- 路径：`/etc/systemd/system/rtc-signal.service`
+- User=elf，工作目录 `/userdata/rtc/server`，崩溃 2 秒自动重启，开机自启
+- 端口：HTTP 3000（页面）/ WS 8080（信令）
+
+### reverse-player.service（播放器）
 - 路径：`/etc/systemd/system/reverse-player.service`
-- 作用：播放器崩溃/退出 3 秒自动重启；开机自启（无需手动拉起）
+- **User=root**（需要 evdev 键盘读取 + DRM master 权限）
+- After/Wants=rtc-signal；崩溃/断连 3 秒自动重启；开机自启
+- **待命模式（重要）**：启动时不创建显示管道；收到浏览器推流请求（request_offer）时自动 `systemctl stop lightdm`（释放 DRM master）→ 建管道全屏显示；按 **Q 键** 销毁管道 → 自动 `systemctl start lightdm` 回桌面 → 播放器回待命。kmssink 与桌面 X 因 DRM master 互斥，由播放器按推流状态自动切换
 - 常用命令：
   ```bash
-  sudo systemctl status reverse-player    # 查看状态/日志
-  sudo systemctl restart reverse-player   # 重启播放器
-  sudo systemctl stop reverse-player      # 停止
-  journalctl -u reverse-player -f         # 跟踪日志
+  sudo systemctl status reverse-player rtc-signal
+  sudo systemctl restart reverse-player
+  journalctl -u reverse-player -f
   ```
-- 注意：手动测试时若用 `pkill` 杀进程，systemd 会在 3 秒后重新拉起——属预期行为
-
-### 信令（WebSocket.js）
-- 未做 systemd，位于 `/userdata/rtc/server/`，手动拉起：
-  ```bash
-  cd /userdata/rtc/server && nohup node WebSocket.js > /tmp/sig.log 2>&1 &
-  ```
-- HTTP 3000（页面）/ WS 8080（信令）。重启板卡后需检查是否存活。
+- 注意：手动 `pkill` 杀进程后 systemd 会重新拉起——属预期行为
 
 ## 二、息屏问题（曾导致视频管道卡死）
 
@@ -64,12 +63,27 @@ echo 0 | sudo tee /sys/class/backlight/backlight-dsi/bl_power   # 亮屏
 ## 四、显示与性能参数
 
 - MIPI 屏：**1024x600@56Hz**（DSI 4lane，300Mbps/lane；面板原生分辨率，勿尝试提高）
-- 视频链路（零 CPU 转换）：`appsrc → h264parse → mppvideodec → rkximagesink sync=false`
+- **视频链路（当前）：`appsrc → h264parse → mppvideodec → kmssink driver-name=rockchip sync=false`**
+  - kmssink DRM 直出：720p 由显示控制器**硬件缩放**全屏，零 CPU；无 X 合成层，无息屏/卡死问题
+  - **桌面环境已停用**（`systemctl disable lightdm`），设备为专用视频终端；按 Q 键或停止推流后桌面可按需拉起（待命模式自动切换）
+  - 曾用 rkximagesink（X 方案）：CPU 转换 7fps 慢动作、X 息屏 vblank 死锁两大问题均因此产生，勿回退
   - **严禁**加 videoconvert/videoscale（CPU 转换 640x360→1024x600 只能跑 ~7fps，慢动作根因）
 - appsrc：`max-bytes=1048576 block=false`（1MB 水位 + 非阻塞）；积压 >512KB 进入丢帧模式 + PLI；>900KB 持续 2 周期自动重建管道（自愈）
 - H264 profile-level-id：offer 中强制 `42e028`（L4.0）；L3.1 会让 Chrome 降级 640x360
 - 码率驱动：板端 `Track::requestBitrate()` → RtcpReceivingSession 发 REMB（1.5M→3M 阶梯）；PC 级 MediaHandler 的 send 回调**静默丢包不可用**（所有 RTCP 必须走 track 级路径）
 - 浏览器端：`getUserMedia ideal 1280x720@30`；`sender.setParameters` maxBitrate=3M + degradationPreference=maintain-resolution
+
+## 四.5、音频（P12 SPKOUT）
+
+- 声卡：`rockchip,rv1126b-acodec`（card 0）；P12 = SPKOUT（Speaker 输出）
+- **acodec 默认静音**（DAC Digital=0、Speaker/spkswitch off）——播放器启动时自动配置（手测 3.1.8 章节）：
+  ```bash
+  amixer -c rockchiprv1126b sset 'Speaker' on
+  amixer -c rockchiprv1126b sset 'spkswitch' on
+  amixer -c rockchiprv1126b sset 'DAC Digital' 250   # 0-510, 250≈-18.75dB
+  ```
+- 音频管道（低延迟）：`appsrc(max-bytes=65536 block=false, do-timestamp) → opusdec → audioconvert → audioresample → alsasink sync=false latency-time=20000 buffer-time=80000`
+- 音画同步：两路均"到达即播"（视频无 PTS——PTS 会触发 mppvideodec 节流），缓冲最小化后实测已同步
 
 ## 五、磁盘/日志维护
 
@@ -94,7 +108,7 @@ echo 0 | sudo tee /sys/class/backlight/backlight-dsi/bl_power   # 亮屏
 
 ## 七、已知未决项
 
-- lightdm conf.d 的 `xserver-command=X -s 0 dpms` 未被 Xorg 实际采纳（Xorg 参数里无 `-s 0`），依赖会话启动后的 xset（如有需要可挂到 LXDE autostart 首行）
 - dw-mci（WiFi SDIO）空闲中断 ~1655 次/s，CPU 开销 <1%，暂不处理
-- 视频窗口尺寸：初始按视频分辨率创建，管道重建后由 X 分配（尺寸可能不同），如需统一可给 rkximagesink 固定窗口
+- RTW WiFi 驱动每 2 秒刷 dmesg（H2C debug 日志），可忽略
 - HTTPS/wss（浏览器 getUserMedia 的安全上下文限制）与正向/反向推流页面合并仍在待办
+- 如需恢复桌面常驻：`sudo systemctl enable --now lightdm`（注意与推流显示互斥，播放器待命模式会自动处理）

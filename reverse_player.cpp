@@ -31,13 +31,17 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <fcntl.h>
 #include <functional>
 #include <iostream>
+#include <linux/input.h>
 #include <map>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <sys/ioctl.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 static std::atomic<bool> g_running{true};
@@ -76,9 +80,14 @@ public:
     std::atomic<bool> osd_warn_lat{false};// 延迟超阈值提醒
     std::atomic<int> osd_loss_pct{0};     // 丢包率估算(0-100)
 
-    bool start() {
+    bool init() {
         gst_init(nullptr, nullptr);
-        if (!createPipes()) return false;
+
+        // SPKOUT(P12) 音频通路初始化 (板载 acodec, 默认静音: DAC 音量 0 / Speaker off)
+        // 参考 ELF-RV1126B 手册 3.1.8 SPKOUT 章节
+        std::system("amixer -c rockchiprv1126b sset 'Speaker' on 2>/dev/null");
+        std::system("amixer -c rockchiprv1126b sset 'spkswitch' on 2>/dev/null");
+        std::system("amixer -c rockchiprv1126b sset 'DAC Digital' 250 2>/dev/null");
 
         // 统计线程: 每 500ms 更新 OSD 帧率/延迟
         osd_stop_ = false;
@@ -111,8 +120,9 @@ public:
         return true;
     }
 
-    // 重建管道: 销毁旧视频/音频窗口与解码资源, 全新状态迎接下一次推流
-    // (旧管道卡死/积压/X 窗口无响应时, 新推流必须从干净状态开始)
+    // 待命模式: kmssink 与桌面 X 互斥 (DRM master)。
+    // 启动时无管道; 浏览器推流(request_offer) -> 停桌面 -> 建管道 -> 全屏显示;
+    // Q 键 -> 销毁管道(释放 DRM) -> 启动桌面 -> 播放器回到待命 (进程不退出)。
     void restart() {
         std::lock_guard<std::recursive_mutex> lock(pipeMtx_);
         std::cout << "[gst] 重建媒体管道 (释放旧窗口/解码资源)..." << std::endl;
@@ -128,16 +138,29 @@ public:
         v_overflow = false;
     }
 
+    // Q 键退出显示: 销毁管道释放 DRM master, 供桌面 X 启动; 播放器进入待命
+    void shutdownPipes() {
+        std::lock_guard<std::recursive_mutex> lock(pipeMtx_);
+        std::cout << "[gst] 关闭推流显示, 进入待命模式..." << std::endl;
+        destroyPipes();
+        v_drop_ = false;
+        v_overflow = false;
+    }
+
+    bool pipesAlive() { return vpipe_ != nullptr; }
+
 private:
     bool createPipes() {
-        // 视频: H264 Annex-B -> 硬解 -> 直连显示
+        // 视频: H264 Annex-B -> 硬解 -> DRM 直出 (硬件缩放全屏)
         // 决定性实测: videoconvert+videoscale(640x360->1024x600 CPU转换)只能跑 ~7fps,
         // 是慢动作的真正根因 (gst-launch 对照: 有转换 6.5fps / 无转换 29fps)
-        // 去掉转换缩放, mppvideodec 直连 rkximagesink (NV12 协商可行, 实验E已验证)
+        // kmssink (DRM plane) 由显示控制器硬件缩放 720p->全屏 1024x600, 零 CPU,
+        // 且绕开 X 栈 (X 停止合成/息屏切换不再导致 vblank 死锁)。
+        // 需 DRM master: lightdm/X 已停用 (systemctl disable lightdm)
         // REVERSE_FAKESINK=1 时用 fakesink 替代显示 (诊断用)
         const char* nodisp = std::getenv("REVERSE_FAKESINK");
         std::string sink = (nodisp && nodisp[0] == '1')
-            ? "fakesink silent=true" : "rkximagesink sync=false";
+            ? "fakesink silent=true" : "kmssink driver-name=rockchip sync=false";
         std::string vdesc =
             "appsrc name=vsrc is-live=true do-timestamp=false format=time "
             "max-bytes=1048576 block=false "   // 1MB(~30s)高水位; 非阻塞防卡 RTC 接收线程
@@ -145,13 +168,15 @@ private:
             "! h264parse ! mppvideodec name=dec "
             "! " + sink;
 
-        // 音频: Opus -> 解码 -> 喇叭
+        // 音频: Opus -> 解码 -> 喇叭 (低延迟调优)
+        // appsrc 缓冲 64KB(~2s@32kbps, 原值可积 4 分钟); alsasink 小缓冲(latency 20ms/buffer 80ms)
+        // sync=false 保持"到达即播", 音画偏差主要来自各段缓冲, 缓冲减小即降低延迟
         std::string adesc =
             "appsrc name=asrc is-live=true do-timestamp=true format=time "
-            "max-bytes=1048576 "
+            "max-bytes=65536 block=false "
             "caps=audio/x-opus,channel-mapping-family=0,channels=2,rate=48000 "
             "! opusdec ! audioconvert ! audioresample "
-            "! autoaudiosink sync=false";
+            "! alsasink sync=false latency-time=20000 buffer-time=80000";
 
         vpipe_ = gst_parse_launch(vdesc.c_str(), nullptr);
         apipe_ = gst_parse_launch(adesc.c_str(), nullptr);
@@ -649,8 +674,15 @@ public:
             if (auto* s = std::get_if<rtc::string>(&data))
                 handleSignal(*s);
         });
-        ws_->onClosed([]() { std::cout << "[sig] 连接关闭" << std::endl; });
-        ws_->onError([](std::string e) { std::cerr << "[sig] 错误: " << e << std::endl; });
+        ws_->onClosed([this]() {
+            std::cout << "[sig] 连接关闭, 退出进程交由 systemd 重启" << std::endl;
+            std::exit(1);   // systemd Restart=always 会拉起, 保证信令断开/启动失败不残留死进程
+        });
+        ws_->onError([](std::string e) {
+            std::cerr << "[sig] 错误: " << e << std::endl;
+            std::cerr << "[sig] 连接失败, 退出进程交由 systemd 重启" << std::endl;
+            std::exit(1);   // 启动时信令未就绪: 退出重试 (systemd RestartSec=3)
+        });
         ws_->open(sigUrl);
         return true;
     }
@@ -721,8 +753,9 @@ private:
             // (正向推流已验证 offerer 模式的 offer 生成正常; answerer 自动 answer 存在
             //  m-line 端口 0 被拒的缺陷, 故反转协商角色)
             std::cout << "[sig] 收到 request_offer, 板卡作为 offerer 生成 offer..." << std::endl;
-            // 每次推流前强制重建管道: 关闭旧 X 视频窗口、释放解码器/appsrc 资源,
-            // 确保旧会话卡死(积压死锁/decoder 卡住)不影响新推流
+            // 每次推流前: 停桌面释放 DRM master (kmssink 需要), 强制重建显示管道
+            // (待命模式下管道不存在; 旧会话卡死也在此一并清理)
+            std::system("systemctl stop lightdm > /dev/null 2>&1");
             media_->restart();
             createOfferer();
         } else if (type == "answer") {
@@ -883,14 +916,57 @@ int main(int argc, char* argv[]) {
     rtc::InitLogger(rtc::LogLevel::Warning);   // Warning: 仅错误/警告 (OSD/帧率由程序自报)
 
     std::cout << "[init] 反向播放器  room=" << room << "  signaling=" << sigUrl << std::endl;
-    std::cout << "[init] 视频: H264 硬解(mppvideodec) -> 1024x600 (rkximagesink)" << std::endl;
-    std::cout << "[init] 音频: Opus 解码 -> ALSA" << std::endl;
+    std::cout << "[init] 视频: H264 硬解(mppvideodec) -> kmssink 全屏(DRM直出)" << std::endl;
+    std::cout << "[init] 音频: Opus 解码 -> ALSA (低延迟)" << std::endl;
+    std::cout << "[init] 按 Q 键退出推流画面并返回桌面" << std::endl;
 
     MediaPipeline media;
-    if (!media.start()) return 1;
+    if (!media.init()) return 1;   // 待命模式启动: 不建显示管道 (推流时按需创建)
 
     ReversePlayer player;
     player.start(sigUrl, room, &media);
+
+    // 键盘监听线程: 检测物理键盘 Q 键按下 -> 退出推流返回桌面
+    // systemd 服务无 tty, 直接读 evdev (/dev/input/event*)。
+    // 退出路径: exit(2) -> systemd RestartPreventExitStatus=2 不再重启播放器
+    //          -> ExecStopPost 启动 lightdm 桌面
+    std::thread([&media]() {
+        // 枚举所有 event 设备, 保留带按键能力的
+        std::vector<int> fds;
+        for (int i = 0; i < 32; ++i) {
+            std::string dev = "/dev/input/event" + std::to_string(i);
+            int fd = open(dev.c_str(), O_RDONLY | O_NONBLOCK);
+            if (fd < 0) continue;
+            uint8_t keybits[KEY_MAX / 8 + 1] = {0};
+            if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) >= 0) {
+                // 检查是否具备 Q(16)/Enter(28) 等典型按键位 (过滤鼠标/触摸)
+                if (keybits[KEY_Q / 8] & (1 << (KEY_Q % 8)))
+                    fds.push_back(fd);
+                else
+                    close(fd);
+            } else {
+                close(fd);
+            }
+        }
+        std::cout << "[key] 键盘监听已启动 (" << fds.size() << " 个设备)" << std::endl;
+        input_event ev{};
+        while (g_running) {
+            bool any = false;
+            for (int fd : fds) {
+                while (read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                    any = true;
+                    if (ev.type == EV_KEY && ev.code == KEY_Q && ev.value == 1) {
+                        std::cout << "[key] 检测到 Q 键, 退出推流显示并返回桌面..." << std::endl;
+                        // 先销毁管道释放 DRM master, 再启动桌面; 播放器保持待命
+                        media.shutdownPipes();
+                        std::system("systemctl start lightdm > /dev/null 2>&1");
+                        std::cout << "[key] 已返回桌面, 等待下一次推流..." << std::endl;
+                    }
+                }
+            }
+            if (!any) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }).detach();
 
     auto lastV = media.v_frames.load(), lastA = media.a_frames.load();
     auto lastVB = media.v_bytes.load(), lastAB = media.a_bytes.load();
