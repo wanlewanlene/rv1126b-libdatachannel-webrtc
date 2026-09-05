@@ -25,6 +25,7 @@
 #include <gst/app/gstappsrc.h>
 
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <csignal>
 #include <cstring>
@@ -77,8 +78,59 @@ public:
 
     bool start() {
         gst_init(nullptr, nullptr);
+        if (!createPipes()) return false;
 
-        // 视频: H264 Annex-B -> 硬解 -> 缩放到屏 1024x600
+        // 统计线程: 每 500ms 更新 OSD 帧率/延迟
+        osd_stop_ = false;
+        osd_thread_ = std::thread([this]() {
+            uint64_t last = 0;
+            auto lastT = std::chrono::steady_clock::now();
+            while (!osd_stop_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                auto now = std::chrono::steady_clock::now();
+                double dt = std::chrono::duration<double>(now - lastT).count();
+                if (dt < 0.4) continue;
+                uint64_t cur = v_frames.load();
+                int fps = int(double(cur - last) / dt + 0.5);
+                last = cur; lastT = now;
+                osd_fps.store(fps);
+
+                char buf[128];
+                int lat = osd_lat_ms.load();
+                int loss = osd_loss_pct.load();
+                bool wlat = osd_warn_lat.load();
+                if (lat < 0)
+                    snprintf(buf, sizeof buf, "FPS: %d   延迟: --   丢包: %d%%", fps, loss);
+                else if (wlat)
+                    snprintf(buf, sizeof buf, "FPS: %d   延迟: %dms !!!   丢包: %d%%", fps, lat, loss);
+                else
+                    snprintf(buf, sizeof buf, "FPS: %d   延迟: %dms   丢包: %d%%", fps, lat, loss);
+                setOsa(buf);
+            }
+        });
+        return true;
+    }
+
+    // 重建管道: 销毁旧视频/音频窗口与解码资源, 全新状态迎接下一次推流
+    // (旧管道卡死/积压/X 窗口无响应时, 新推流必须从干净状态开始)
+    void restart() {
+        std::lock_guard<std::recursive_mutex> lock(pipeMtx_);
+        std::cout << "[gst] 重建媒体管道 (释放旧窗口/解码资源)..." << std::endl;
+        destroyPipes();
+        if (!createPipes()) {
+            std::cerr << "[gst] 管道重建失败!" << std::endl;
+            return;
+        }
+        // 重置流统计 (旧会话计数无意义)
+        v_frames = 0; v_bytes = 0; a_frames = 0; a_bytes = 0; dec_frames = 0;
+        v_dropped_ = 0;
+        v_drop_ = false;
+        v_overflow = false;
+    }
+
+private:
+    bool createPipes() {
+        // 视频: H264 Annex-B -> 硬解 -> 直连显示
         // 决定性实测: videoconvert+videoscale(640x360->1024x600 CPU转换)只能跑 ~7fps,
         // 是慢动作的真正根因 (gst-launch 对照: 有转换 6.5fps / 无转换 29fps)
         // 去掉转换缩放, mppvideodec 直连 rkximagesink (NV12 协商可行, 实验E已验证)
@@ -88,7 +140,7 @@ public:
             ? "fakesink silent=true" : "rkximagesink sync=false";
         std::string vdesc =
             "appsrc name=vsrc is-live=true do-timestamp=false format=time "
-            "max-bytes=16777216 "
+            "max-bytes=1048576 block=false "   // 1MB(~30s)高水位; 非阻塞防卡 RTC 接收线程
             "caps=video/x-h264,stream-format=(string)byte-stream "
             "! h264parse ! mppvideodec name=dec "
             "! " + sink;
@@ -129,49 +181,71 @@ public:
         if (!tov_) std::cerr << "[gst] 警告: textoverlay 未创建 (OSD 不可用)" << std::endl;
         else setOsa("[init] 等待视频流...");
 
-        // 统计线程: 每 500ms 更新 OSD 帧率/延迟
-        osd_stop_ = false;
-        osd_thread_ = std::thread([this]() {
-            uint64_t last = 0;
-            auto lastT = std::chrono::steady_clock::now();
-            while (!osd_stop_.load()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                auto now = std::chrono::steady_clock::now();
-                double dt = std::chrono::duration<double>(now - lastT).count();
-                if (dt < 0.4) continue;
-                uint64_t cur = v_frames.load();
-                int fps = int(double(cur - last) / dt + 0.5);
-                last = cur; lastT = now;
-                osd_fps.store(fps);
-
-                char buf[128];
-                int lat = osd_lat_ms.load();
-                int loss = osd_loss_pct.load();
-                bool wlat = osd_warn_lat.load();
-                if (lat < 0)
-                    snprintf(buf, sizeof buf, "FPS: %d   延迟: --   丢包: %d%%", fps, loss);
-                else if (wlat)
-                    snprintf(buf, sizeof buf, "FPS: %d   延迟: %dms !!!   丢包: %d%%", fps, lat, loss);
-                else
-                    snprintf(buf, sizeof buf, "FPS: %d   延迟: %dms   丢包: %d%%", fps, lat, loss);
-                setOsa(buf);
-            }
-        });
-
         // 总线监听: 打印管道错误/警告 (否则 mppvideodec 协商失败等无法察觉)
         installBusWatch(vpipe_, "video");
         installBusWatch(apipe_, "audio");
 
+        // 进入 PLAYING (start 与 restart 两条路径都必须执行, 否则管道停留 NULL 无画面)
         GstStateChangeReturn r1 = gst_element_set_state(vpipe_, GST_STATE_PLAYING);
         GstStateChangeReturn r2 = gst_element_set_state(apipe_, GST_STATE_PLAYING);
         std::cout << "[gst] video pipe -> " << r1 << ", audio pipe -> " << r2 << std::endl;
         return true;
     }
 
+    void destroyPipes() {
+        if (vpipe_) {
+            gst_element_set_state(vpipe_, GST_STATE_NULL);
+            if (vsrc_) { gst_object_unref(vsrc_); vsrc_ = nullptr; }
+            if (tov_)  { gst_object_unref(tov_);  tov_ = nullptr; }
+            gst_object_unref(vpipe_);
+            vpipe_ = nullptr;
+        }
+        if (apipe_) {
+            gst_element_set_state(apipe_, GST_STATE_NULL);
+            if (asrc_) { gst_object_unref(asrc_); asrc_ = nullptr; }
+            gst_object_unref(apipe_);
+            apipe_ = nullptr;
+        }
+    }
+
+public:
     void pushVideo(const uint8_t* data, size_t len, double ptsSec = -1.0) {
         if (!vsrc_) return;
+        // 积压丢弃模式: 丢非关键帧, 遇 IDR/SPS 恢复 (配合向浏览器请求 PLI)
+        // 无 PTS 链路无时间基准丢帧, 用 appsrc 字节数积压指标代替 (见主循环监测)
+        if (v_drop_.load()) {
+            if (hasKeyframeNal(data, len)) {
+                v_drop_.store(false);
+            } else {
+                v_dropped_++;
+                return;
+            }
+        }
         pushBuffer(vsrc_, data, len, ptsSec, [&](bool ok){ if (!ok) v_overflow = true; });
         v_frames++; v_bytes += len;
+    }
+
+    // appsrc 积压字节数 (live 流延迟的直接指标)
+    guint64 videoBacklog() {
+        if (!vsrc_) return 0;
+        guint64 level = 0;
+        g_object_get(G_OBJECT(vsrc_), "current-level-bytes", &level, nullptr);
+        return level;
+    }
+
+    std::atomic<bool> v_drop_{false};
+    std::atomic<uint32_t> v_dropped_{0};
+
+    // Annex-B 流中是否含关键帧 NAL (IDR=5 / SPS=7)
+    static bool hasKeyframeNal(const uint8_t* data, size_t len) {
+        if (len < 5) return false;
+        for (size_t i = 0; i + 3 < len; ++i) {
+            if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
+                uint8_t t = data[i+3] & 0x1F;
+                if (t == 5 || t == 7) return true;
+            }
+        }
+        return false;
     }
 
     void pushAudio(const uint8_t* data, size_t len) {
@@ -181,6 +255,7 @@ public:
     }
 
     void setOsa(const char* text) {
+        std::lock_guard<std::recursive_mutex> lock(pipeMtx_);   // 防与重建竞态 (tov_ 可能被销毁)
         if (tov_) g_object_set(tov_, "text", text, nullptr);
     }
 
@@ -219,6 +294,7 @@ private:
 
     void pushBuffer(GstElement* src, const uint8_t* data, size_t len, double ptsSec,
                     const std::function<void(bool)>& onErr) {
+        std::lock_guard<std::recursive_mutex> lock(pipeMtx_);   // 防与管道重建竞态
         GstBuffer* buf = gst_buffer_new_allocate(nullptr, len, nullptr);
         gst_buffer_fill(buf, 0, data, len);
         if (ptsSec >= 0)
@@ -228,6 +304,8 @@ private:
         gst_buffer_unref(buf);
         if (ret != GST_FLOW_OK && onErr) onErr(false);
     }
+
+    std::recursive_mutex pipeMtx_;   // 保护管道操作与重建 (createPipes 内 setOsa 会重入)
 
     GstElement* vpipe_ = nullptr;
     GstElement* apipe_ = nullptr;
@@ -318,7 +396,59 @@ public:
         clock_bias_min_ = -1.0;
         total_pkt_ = lost_pkt_ = 0;
         sr_warned_ = false;
+        startRemb();                             // 驱动浏览器带宽估计 (见下)
     }
+
+    // 请求关键帧: 经 vtrack_ 的 RtcpReceivingSession (track 级 transportSend 路径)。
+    // 自家 sendPli/sendNack 走 PC 级 send 回调 -> forwardMedia 静默丢弃, 从未出网 (抓包证实)。
+    // 单包丢失也用 PLI 替代 NACK (PLI 有 0.5s 限流, 代价是整帧刷新; NACK 反正发不出去)。
+    void requestKeyframe() {
+        auto track = vtrack_;
+        if (track) track->requestKeyframe();
+    }
+
+    ~ReverseMediaHandler() { stopRemb(); }
+
+private:
+    // ---- REMB: 板卡(接收端)周期性向浏览器声明带宽估计 ----
+    // 板卡链路无 TWCC/REMB 反馈时, Chrome 带宽估计死在默认 ~300kbps 永不爬升
+    // (实测 640x360@282kbps, maxBitrate=3M 只是上限不改变估计值)。
+    // libdatachannel 的 H264 codec 声明已含 goog-remb feedback, 浏览器接受 REMB RTCP。
+    void startRemb() {
+        stopRemb();
+        rembRun_ = true;
+        rembThread_ = std::thread([this]() {
+            // 阶梯驱动: 1.5M -> 3M, Chrome 的 REMB 直接覆盖带宽估计
+            const uint32_t steps[] = {1500000, 3000000};
+            int idx = 0;
+            int logCnt = 0;
+            while (rembRun_.load()) {
+                // 用官方 RtcpReceivingSession::requestBitrate -> pushREMB -> transportSend
+                // (track 级发送路径, 与正向推流同一发送链, 已验证可出网)。
+                // PC 级 handler 的 send 回调经 forwardMedia -> dynamic_pointer_cast<DtlsSrtpTransport>
+                // 静默失败 (抓包证实 RTCP 全部未出网), 不可用。
+                auto track = vtrack_;
+                if (track && v_remote_ssrc_ != 0) {
+                    bool ok = track->requestBitrate(steps[idx]);
+                    if (++logCnt <= 4)
+                        std::cout << "[qos] REMB " << (ok ? "发送成功 -> " : "发送失败 -> ")
+                                  << steps[idx] << " (media ssrc=" << v_remote_ssrc_ << ")" << std::endl;
+                }
+                idx = std::min(idx + 1, 1);
+                // 每 1.5s 一发 (100ms 步进等待, 便于及时退出)
+                for (int i = 0; i < 15 && rembRun_.load(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+
+    void stopRemb() {
+        if (rembRun_.exchange(false) && rembThread_.joinable())
+            rembThread_.join();
+    }
+
+public:
+    void setVideoTrack(std::shared_ptr<rtc::Track> t) { vtrack_ = t; }
 
 private:
     // ---- RTP 解析辅助 (大端) ----
@@ -343,15 +473,15 @@ private:
             if (gap > 0 && gap < 4096) {         // 丢包: 连续小间隔
                 lost_pkt_ += gap;
                 if (gap < 256) {
-                    // 细粒度恢复: 单包丢失用 NACK 请求重传 (最多带 8 个 PID)
-                    sendNack(ssrc, seq, gap);
+                    // 单包丢失: PLI 请求关键帧 (NACK 经 PC 级回调发不出去, 统一走 PLI)
+                    requestKeyframe();
                 } else {
-                    sendPli();                    // 大量丢失直接请求关键帧
+                    requestKeyframe();            // 大量丢失直接请求关键帧
                 }
             } else if (gap >= 4096 || gap < -4096) {
                 // 序列号大跳变: 流重置 (可能是新编码会话), 请求关键帧
                 v_have_seq_ = false;
-                sendPli();
+                requestKeyframe();
             }
         }
 
@@ -382,7 +512,7 @@ private:
         media_->osd_loss_pct.store(lossPct);
 
         // 周期保底 PLI: 仅长间隔一次 (过大 IDR 帧在软编端会造成周期性卡顿, 频率必须低)
-        if (now - last_pli_ > 10.0) sendPli();
+        if (now - last_pli_ > 10.0) requestKeyframe();
     }
 
     // ---- RTCP 解析: Sender Report 提供 (NTP <-> RTP ts) 时间基准 ----
@@ -488,6 +618,11 @@ private:
     bool v_have_pending_ = false;
     std::deque<double> raw_delays_;
     double clock_bias_min_ = -1.0;
+
+    // REMB 驱动线程
+    std::thread rembThread_;
+    std::atomic<bool> rembRun_{false};
+    std::shared_ptr<rtc::Track> vtrack_;   // track 级 RTCP 发送路径
 };
 
 // ----------------------------------------------------------------------------
@@ -495,6 +630,11 @@ private:
 // ----------------------------------------------------------------------------
 class ReversePlayer {
 public:
+    // 积压回收: 请求浏览器发关键帧 (经 handler 转发 PLI)
+    void requestKeyframe() {
+        if (handler_) handler_->requestKeyframe();
+    }
+
     bool start(const std::string& sigUrl, const std::string& room, MediaPipeline* media) {
         room_ = room;
         media_ = media;
@@ -581,6 +721,9 @@ private:
             // (正向推流已验证 offerer 模式的 offer 生成正常; answerer 自动 answer 存在
             //  m-line 端口 0 被拒的缺陷, 故反转协商角色)
             std::cout << "[sig] 收到 request_offer, 板卡作为 offerer 生成 offer..." << std::endl;
+            // 每次推流前强制重建管道: 关闭旧 X 视频窗口、释放解码器/appsrc 资源,
+            // 确保旧会话卡死(积压死锁/decoder 卡住)不影响新推流
+            media_->restart();
             createOfferer();
         } else if (type == "answer") {
             std::string sdp;
@@ -650,14 +793,44 @@ private:
         adesc.addSSRC(43, std::string("audio-recv"), std::string("stream1"), std::string("audio"));
         atrack_ = pc_->addTrack(adesc);
 
+        // 挂 RtcpReceivingSession 到视频 track: 提供 requestBitrate(REMB) 官方路径
+        vtrack_->setMediaHandler(std::make_shared<rtc::RtcpReceivingSession>());
+
         // PC 级收流处理 (在 SSRC 路由之前, 直接拿到全部解密后的 RTP)
         handler_ = std::make_shared<ReverseMediaHandler>(media_);
+        handler_->setVideoTrack(vtrack_);   // REMB 经 track 级路径发送 (PC 级 send 回调静默丢弃)
         handler_->resetSession();
         pc_->setMediaHandler(handler_);
 
         // 板卡为 offerer: 发 offer (浏览器 answerer 应答)
         pc_->onLocalDescription([this](rtc::Description desc) {
             std::string sdp = std::string(desc);
+            // 提升编码能力声明: libdatachannel 默认 H264 level 3.1 (42e01f, MaxMBPS=99000)
+            // 撑不住 720p@30fps(需 108000) -> 浏览器严格降级编码到 640x360@280kbps (实测)。
+            // Level 4.0 (42e028): MaxFS=8192/MaxMBPS=245760, 支持 1080p30/720p60。
+            {
+                const std::string from = "profile-level-id=42e01f";
+                const std::string to   = "profile-level-id=42e028";
+                size_t p = 0;
+                while ((p = sdp.find(from, p)) != std::string::npos) {
+                    sdp.replace(p, from.size(), to);
+                    p += to.size();
+                }
+            }
+            // offer 侧声明视频带宽上限 3Mbps: 浏览器据此提高编码初始码率
+            // (无此行时浏览器保守起步 ~280kbps, 且无 REMB/TWCC 反馈永不爬升)
+            // 注意 SDP 顺序规范 m= -> c= -> b=, b= 必须插在媒体段 c= 行之后 (此前插错位置被忽略)
+            {
+                size_t mv = sdp.find("m=video");
+                if (mv != std::string::npos) {
+                    size_t cpos = sdp.find("c=IN", mv);
+                    if (cpos != std::string::npos) {
+                        size_t eol = sdp.find('\n', cpos);
+                        if (eol != std::string::npos)
+                            sdp.insert(eol + 1, "b=AS:3000\r\n");
+                    }
+                }
+            }
             std::cout << "[sig] 发送 " << desc.typeString()
                       << " (SDP " << sdp.size() << " 字节)" << std::endl;
             sendJson({{"type", "offer"}, {"room", room_}, {"sdp", sdp}});
@@ -723,6 +896,7 @@ int main(int argc, char* argv[]) {
     auto lastVB = media.v_bytes.load(), lastAB = media.a_bytes.load();
     auto lastD = media.dec_frames.load();
     auto lastT = std::chrono::steady_clock::now();
+    int stuckCnt = 0;
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         g_main_context_iteration(nullptr, FALSE);   // 派发总线消息
@@ -737,7 +911,29 @@ int main(int argc, char* argv[]) {
             std::cout << "[stat] 输入 " << (v - lastV) / 2 << "fps (" << (vb - lastVB) / 2 / 1024
                       << "KB/s) 解码输出 " << (d - lastD) / 2 << "fps, 音频 "
                       << (a - lastA) / 2 << "/s, 丢包 " << loss << "%, 单向延迟估算 " << lat << "ms"
+                      << " 积压 " << media.videoBacklog() / 1024 << "KB"
+                      << " 丢帧累计 " << media.v_dropped_.load()
                       << (media.v_overflow.load() ? "  [溢出!]" : "") << std::endl;
+            // 积压回收: appsrc 队列 > 512KB(~15s@270kbps) -> 丢帧至下一关键帧 + PLI 同步
+            if (media.videoBacklog() > 512 * 1024 && !media.v_drop_.load()) {
+                media.v_drop_.store(true);
+                player.requestKeyframe();
+                std::cout << "[qos] 推流积压超阈值, 进入丢帧模式并请求关键帧" << std::endl;
+            }
+            // 显示链路自愈: appsrc 已满溢出(max-bytes 1MB 附近)持续 2 个周期 = 管道卡死
+            // (典型场景: MIPI 息屏触发 fb blank -> rkximagesink 等 vblank 死锁)
+            // 自动重建管道恢复, 无需人工重新推流
+            if (media.videoBacklog() > 900 * 1024) {
+                stuckCnt++;
+                if (stuckCnt >= 2) {
+                    std::cout << "[qos] 显示链路疑似卡死(积压 " << media.videoBacklog() / 1024
+                              << "KB 持续超限), 自动重建管道" << std::endl;
+                    media.restart();
+                    stuckCnt = 0;
+                }
+            } else {
+                stuckCnt = 0;
+            }
             lastV = v; lastA = a; lastVB = vb; lastAB = ab; lastD = d; lastT = now;
         }
     }

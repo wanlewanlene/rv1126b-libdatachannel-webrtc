@@ -132,6 +132,8 @@
 
             <div class="hint">本地预览（摄像头）</div>
 
+            <div class="hint" id="sendStats" style="color:#3fb950"></div>
+
         </div>
 
     </div>
@@ -158,7 +160,49 @@
 
 
 
-        let pc = null, ws = null, localStream = null;
+        let pc = null, ws = null, localStream = null, senders = null;
+
+        // 实测: 板卡 answer 无 TWCC/REMB 带宽反馈时, Edge 用保守编码 (降到 640x360 @ ~270kbps)
+        // 显式设编码参数: 锁定源分辨率 + 放开码率上限
+        async function forceHdEncoding() {
+            const vs = senders && senders['video'];
+            if (!vs) return;
+            try {
+                const p = vs.getParameters();
+                if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+                p.encodings[0].maxBitrate = 3000000;              // 3Mbps (720p 建议值)
+                p.encodings[0].scaleResolutionDownBy = 1.0;       // 禁止降分辨率
+                p.encodings[0].degradationPreference = 'maintain-resolution'; // 拥塞时降帧率不降分辨率
+                await vs.setParameters(p);
+                const q = vs.getParameters();   // 回读确认
+                const mb = q.encodings && q.encodings[0] && q.encodings[0].maxBitrate;
+                document.getElementById('sendStats').textContent =
+                    'setParameters ' + (mb === 3000000 ? '已生效 maxBitrate=3M' : '未生效 maxBitrate=' + mb);
+            } catch (err) { console.warn('setParameters 失败:', err); }
+        }
+
+        // 发送质量监控: 每 2s 显示 实际发送分辨率/帧率/码率
+        let lastBytes = 0, lastTs = 0, statsTimer = null;
+        function startSendStats() {
+            const el = document.getElementById('sendStats');
+            if (statsTimer) clearInterval(statsTimer);
+            statsTimer = setInterval(async () => {
+                if (!pc) { el.textContent = ''; return; }
+                try {
+                    const stats = await pc.getStats();
+                    stats.forEach(r => {
+                        if (r.type === 'outbound-rtp' && r.kind === 'video') {
+                            let kbps = 0;
+                            if (lastTs && r.bytesSent) kbps = Math.round((r.bytesSent - lastBytes) * 8 / ((r.timestamp - lastTs)));
+                            lastBytes = r.bytesSent; lastTs = r.timestamp;
+                            el.textContent = '发送: ' + (r.frameWidth || '?') + 'x' + (r.frameHeight || '?')
+                                + ' @ ' + Math.round(r.framesPerSecond || 0) + 'fps, ' + kbps + 'kbps'
+                                + ' | 采集: ' + (localVideo.videoWidth || '?') + 'x' + (localVideo.videoHeight || '?');
+                        }
+                    });
+                } catch (err) { /* 忽略 */ }
+            }, 2000);
+        }
 
 
 
@@ -203,6 +247,8 @@
             }
 
             localVideo.srcObject = null;
+
+            senders = null; lastBytes = 0; lastTs = 0;
 
         }
 
@@ -268,8 +314,8 @@
             // 编解码无需本端偏好: 板卡 offer 仅声明 H264(96)/Opus(111), 应答时只能选它们
             // 注意: Edge 上 addTransceiver+replaceTrack 组合存在方向协商缺陷 (answer 中
             //       视频 m-line 降级为 a=inactive 不发流), 故统一使用 addTrack 原生绑定
-
-            localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+            senders = {};
+            localStream.getTracks().forEach(t => { senders[t.kind] = pc.addTrack(t, localStream); });
 
 
 
@@ -333,6 +379,8 @@
 
                         setStatus('已发送 answer, 建立连接中...');
 
+                        await forceHdEncoding();   // answer 锁定后再设编码参数 (避免被协商重置)
+
                     } catch (err) { setStatus('应答失败: ' + err.message, 'error'); }
 
                 } else if (msg.type === 'ice') {
@@ -378,6 +426,8 @@
             restartBtn.disabled = false;
 
             stopBtn.disabled = false;
+
+            startSendStats();
 
         }
 
