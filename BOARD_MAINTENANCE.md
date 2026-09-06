@@ -10,6 +10,12 @@
 - User=elf，工作目录 `/userdata/rtc/server`，崩溃 2 秒自动重启，开机自启
 - 端口：HTTP 3000（页面）/ WS 8080（信令）
 
+### rtc-forward.service（正向推流：板卡摄像头 → 浏览器）
+- 路径：`/etc/systemd/system/rtc-forward.service`（2026-09-06 新增）
+- User=root，`ExecStart=/bin/bash /userdata/rtc/run.sh`（run.sh 内含 TURN 拉起、MIC 增益固化、路由修复）
+- `ExecStartPre=/bin/sleep 8`：等 USB 摄像头枚举完成（过早启动会 open /dev/video52 failed）
+- 崩溃 5 秒自动重启；开机自启。此前正向推流靠手动 run.sh，**断电后不会自启**（曾造成"推流中断"假故障）
+
 ### reverse-player.service（播放器）
 - 路径：`/etc/systemd/system/reverse-player.service`
 - **User=root**（需要 evdev 键盘读取 + DRM master 权限）
@@ -23,7 +29,35 @@
   ```
 - 注意：手动 `pkill` 杀进程后 systemd 会重新拉起——属预期行为
 
-## 二、息屏问题（曾导致视频管道卡死）
+## 二、断电/异常关机后的恢复（SOP）
+
+1. 上电后等待 **1-2 分钟**（USB 摄像头枚举 + 服务启动），再检查：
+   ```bash
+   systemctl is-active rtc-signal rtc-forward reverse-player   # 期望 3 个 active
+   pgrep -af 'rv1126b_webrtc_push|reverse_player_bin|node WebSocket'
+   ```
+2. 三者均已 `enabled`，正常情况下自动恢复；若某服务未起：`sudo systemctl restart <服务名>`
+3. **检查磁盘**（rootfs 满会导致 MIPI 死机、服务异常）：
+   ```bash
+   df -h /            # >90% 需清理
+   sudo journalctl --vacuum-size=30M
+   sudo apt-get clean
+   sudo du -xh --max-depth=3 /var /root 2>/dev/null | sort -rh | head -8   # 找大目录
+   ```
+   已知大户：`/var/log`(586M)、`/root/elf-env`(220M python 环境)、`/root/libdatachannel`(202M 源码)
+4. 内核检查（排除文件系统损坏/驱动初始化失败）：
+   ```bash
+   dmesg | grep -iE 'error|fail|ext4|fsck|corrupt|dsi|vop|drm|panic' | grep -viE 'RTW|gmac|dmc' | tail -20
+   ```
+   正常情况只会出现 `rkcif ... sensor info failed`（板子未接 MIPI CSI 摄像头，属预期）
+5. 屏状态确认：
+   ```bash
+   cat /sys/class/backlight/backlight-dsi/bl_power   # 0=亮
+   cat /sys/class/drm/card0-DSI-1/dpms               # On
+   ```
+6. **“屏幕卡住/进不了桌面”通常是预期状态**：lightdm 已禁用（推流模式无需桌面），反向推流未开始时屏上无内容。需要桌面：`sudo systemctl start lightdm`；推流时播放器会自动停桌面、按 Q 返回桌面。
+
+## 三、息屏问题（曾导致视频管道卡死）
 
 ### 根因链
 无操作计时息屏（light-locker / xscreensaver）→ DPMS Off → 内核关闭 VOP CRTC/DSI
