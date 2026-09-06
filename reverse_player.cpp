@@ -168,15 +168,16 @@ private:
             "! h264parse ! mppvideodec name=dec "
             "! " + sink;
 
-        // 音频: Opus -> 解码 -> 喇叭 (低延迟调优)
-        // appsrc 缓冲 64KB(~2s@32kbps, 原值可积 4 分钟); alsasink 小缓冲(latency 20ms/buffer 80ms)
-        // sync=false 保持"到达即播", 音画偏差主要来自各段缓冲, 缓冲减小即降低延迟
+        // 音频: Opus -> 解码 -> 喇叭 (低延迟, 直连 ALSA 硬件)
+        // device=plughw:0,0 绕开 pulseaudio: pulse 与正向推流的 ALSA 采集占卡冲突时
+        // alsa-sink 线程会忙等占满 CPU(state 卡在 OPEN), 且导致反向无声、视频渲染线程饥饿卡顿。
+        // pulseaudio 已在板卡停用 (chmod -x /usr/bin/pulseaudio)。
         std::string adesc =
             "appsrc name=asrc is-live=true do-timestamp=true format=time "
             "max-bytes=65536 block=false "
             "caps=audio/x-opus,channel-mapping-family=0,channels=2,rate=48000 "
             "! opusdec ! audioconvert ! audioresample "
-            "! alsasink sync=false latency-time=20000 buffer-time=80000";
+            "! alsasink device=plughw:0,0 sync=false latency-time=20000 buffer-time=80000";
 
         vpipe_ = gst_parse_launch(vdesc.c_str(), nullptr);
         apipe_ = gst_parse_launch(adesc.c_str(), nullptr);

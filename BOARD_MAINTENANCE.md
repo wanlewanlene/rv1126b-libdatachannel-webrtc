@@ -73,17 +73,33 @@ echo 0 | sudo tee /sys/class/backlight/backlight-dsi/bl_power   # 亮屏
 - 码率驱动：板端 `Track::requestBitrate()` → RtcpReceivingSession 发 REMB（1.5M→3M 阶梯）；PC 级 MediaHandler 的 send 回调**静默丢包不可用**（所有 RTCP 必须走 track 级路径）
 - 浏览器端：`getUserMedia ideal 1280x720@30`；`sender.setParameters` maxBitrate=3M + degradationPreference=maintain-resolution
 
-## 四.5、音频（P12 SPKOUT）
+## 四.5、音频（P12 SPKOUT / 板载 MIC）
 
-- 声卡：`rockchip,rv1126b-acodec`（card 0）；P12 = SPKOUT（Speaker 输出）
-- **acodec 默认静音**（DAC Digital=0、Speaker/spkswitch off）——播放器启动时自动配置（手测 3.1.8 章节）：
+- 声卡：`rockchip,rv1126b-acodec`（card 0）；P12 = SPKOUT（Speaker 输出）；板载 MIC = 采集
+- **`/etc/asound.conf`（关键！pulseaudio 移除后必须存在）**：
+  ```
+  pcm.!default {
+      type plug
+      slave.pcm "hw:0,0"
+  }
+  ctl.!default {
+      type hw
+      card 0
+  }
+  ```
+  作用：把 ALSA `default` 设备直连硬件。**pulseaudio 已被移除**（`chmod -x /usr/bin/pulseaudio`），无此文件时 `default` 采集/播放失效——表现为：正向推流采集 closed 无声、反向播放器 asrc 线程自旋占 87% CPU + 无声
+- **acodec 默认静音**（DAC Digital=0、Speaker/spkswitch off）——反向播放器启动时自动配置：
   ```bash
   amixer -c rockchiprv1126b sset 'Speaker' on
   amixer -c rockchiprv1126b sset 'spkswitch' on
   amixer -c rockchiprv1126b sset 'DAC Digital' 250   # 0-510, 250≈-18.75dB
   ```
-- 音频管道（低延迟）：`appsrc(max-bytes=65536 block=false, do-timestamp) → opusdec → audioconvert → audioresample → alsasink sync=false latency-time=20000 buffer-time=80000`
+- **正向推流 MIC 采集增益**（run.sh 固化）：`ACodec_LP PGA Gain 84%`、`ACodec_LP Digital Gain 75%`、`HPF on 60Hz`
+- 采集/播放设备状态检查：`cat /proc/asound/card0/pcm0c/sub0/status`（采集）/ `pcm0p`（播放），期望 RUNNING 且 owner_pid 为对应进程
+- 音频管道（低延迟，反向播放）：`appsrc(max-bytes=65536 block=false, do-timestamp) → opusdec → audioconvert → audioresample → alsasink device=plughw:0,0 sync=false latency-time=20000 buffer-time=80000`
+  - **device=plughw:0,0 必须显式指定**（default 会解析到已移除的 pulse）
 - 音画同步：两路均"到达即播"（视频无 PTS——PTS 会触发 mppvideodec 节流），缓冲最小化后实测已同步
+- **pulseaudio 已移除的原因**：与正向推流 ALSA 采集占卡冲突时 alsa-sink 线程忙等占满 2 核（99.9%+88.2%），导致反向视频间歇卡顿+无声；且其 alsa-sink 状态卡 OPEN 不真正启动
 
 ## 五、磁盘/日志维护
 
