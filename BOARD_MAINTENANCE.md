@@ -3,6 +3,16 @@
 > 2026-09-06 整理。记录反向推流功能涉及的所有板端系统级修改，供后续维护。
 > 板卡 IP 为 DHCP 动态（热点拓扑 192.168.137.184，路由器拓扑 192.168.2.x），SSH 用户 `elf` 密码 `elf`。
 
+## ⭐ 显示模式说明（维护清单必读）
+
+**MIPI 屏停留在开机图标界面 = 推流待命模式的预期状态，不是故障。**
+桌面系统按需启停，开机不直接进桌面，停在开机图标等待推流；收到推流请求时自动停桌面全屏显示；按 Q 自动回桌面。
+
+- 想临时进桌面：`sudo systemctl start lightdm`
+- 想开机直接进桌面：`sudo systemctl enable lightdm`（与推流兼容，播放器会自动切换）
+- 想恢复"专用视频终端"默认模式：`sudo systemctl disable lightdm`
+- 判断屏是否正常：`cat /sys/class/backlight/backlight-dsi/bl_power`（0=背光亮）+ `cat /sys/class/drm/card0-DSI-1/dpms`（On）
+
 ## 一、服务与守护（双 systemd 服务，已 enable）
 
 ### rtc-signal.service（信令）
@@ -148,6 +158,8 @@ echo 0 | sudo tee /sys/class/backlight/backlight-dsi/bl_power   # 亮屏
   - **pipewire/wireplumber/pipewire-pulse 已 global mask**（崩溃循环刷 syslog ~230B/s，桌面组件无桌面时无用）
   - 残余 syslog 增速 ~100B/s（root 用户实例启动消息等），logrotate 兜底，无需再处理
 - rootfs 常态检查：`df -h /`（>90% 需清理）
+- **DMC 内存控制器锁频（2026-09-08）**：双流时 `dmc_ondemand` 降频（324MHz）导致 rkvdec2 解码任务超时（force_dequeue + 硬件 reset）→ 反向视频卡顿。已锁 `governor=performance`、`min_freq=1332000000`；持久化在 `/userdata/rtc/run.sh` 第 3-4 行（开机自动执行）。验证：`cat /sys/class/devfreq/dmc/governor; cat /sys/class/devfreq/dmc/cur_freq`（应 performance / 1332000000）
+- 板端日志观察卡顿：`journalctl -u reverse-player -f`（`[stat]` 的"积压KB/丢帧累计/解码输出fps"），rkvdec 超时看 `dmesg | grep -i rkvdec`
 - tcpdump 已安装（抓包诊断 RTCP：`sudo tcpdump -i wlan0 -n udp -w /tmp/x.pcap`，媒体走 wlan0，eth0 为 DOWN）
 - 重编 libdatachannel 时需从 `/userdata/archive/root-libdatachannel` 移回 `/root/libdatachannel`
 
