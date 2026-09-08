@@ -974,6 +974,7 @@ int main(int argc, char* argv[]) {
     auto lastD = media.dec_frames.load();
     auto lastT = std::chrono::steady_clock::now();
     int stuckCnt = 0;
+    int stuckDecCnt = 0;
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         g_main_context_iteration(nullptr, FALSE);   // 派发总线消息
@@ -1011,7 +1012,23 @@ int main(int argc, char* argv[]) {
             } else {
                 stuckCnt = 0;
             }
-            lastV = v; lastA = a; lastVB = vb; lastAB = ab; lastD = d; lastT = now;
+            // 解码器停摆自愈: 输入正常但解码输出连续 4 个周期(8s)为 0 -> 重建管道。
+            // (实测: 浏览器分辨率切换 640x360<->1280x720 时 rkvdec2 slot 冲突 -> task timeout
+            //  -> reset 序列后长期停摆; 此时 mpp 吞帧不吐, appsrc 积压为 0, 上面的积压检测失效)
+            if (v - lastV > 0 && d == lastD) {
+                stuckDecCnt++;
+                if (stuckDecCnt >= 4) {
+                    std::cout << "[qos] 解码器停摆(输入正常, 解码输出连续8s为0), 自动重建管道" << std::endl;
+                    media.restart();
+                    stuckDecCnt = 0;
+                }
+            } else {
+                stuckDecCnt = 0;
+            }
+            // 统计基线从 media 重新读取 (restart 会重置计数, 直接用本地旧值会产生负数)
+            lastV = media.v_frames.load(); lastA = media.a_frames.load();
+            lastVB = media.v_bytes.load(); lastAB = media.a_bytes.load();
+            lastD = media.dec_frames.load(); lastT = now;
         }
     }
     std::cout << "[init] 退出" << std::endl;

@@ -286,6 +286,11 @@
 
             });
 
+            // contentHint='motion': 摄像头流带宽不足时优先降帧率、不降分辨率。
+            // (板端实测: 浏览器在 640x360<->1280x720 间动态切换会触发 rkvdec2 解码器
+            //  slot 冲突 -> task timeout -> 长期停摆 (画面冻结十几秒), 必须锁定分辨率)
+            localStream.getVideoTracks().forEach(t => { try { t.contentHint = 'motion'; } catch (e) {} });
+
             localVideo.srcObject = localStream;
 
             localVideo.muted = true;
