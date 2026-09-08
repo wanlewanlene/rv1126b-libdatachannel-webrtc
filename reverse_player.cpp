@@ -126,6 +126,8 @@ public:
     void restart() {
         std::lock_guard<std::recursive_mutex> lock(pipeMtx_);
         std::cout << "[gst] 重建媒体管道 (释放旧窗口/解码资源)..." << std::endl;
+        spsChanged_.store(false);
+        lastDecMs_.store(steadyMs());   // 防 rebuild 期间看门狗误触发
         destroyPipes();
         if (!createPipes()) {
             std::cerr << "[gst] 管道重建失败!" << std::endl;
@@ -197,7 +199,9 @@ private:
             if (srcpad) {
                 gst_pad_add_probe(srcpad, GST_PAD_PROBE_TYPE_BUFFER,
                     [](GstPad*, GstPadProbeInfo* info, gpointer data) -> GstPadProbeReturn {
-                        static_cast<MediaPipeline*>(data)->dec_frames++;
+                        auto* self = static_cast<MediaPipeline*>(data);
+                        self->dec_frames++;
+                        self->lastDecMs_.store(steadyMs());
                         return GST_PAD_PROBE_OK;
                     }, this, nullptr);
                 gst_object_unref(srcpad);
@@ -261,6 +265,14 @@ public:
 
     std::atomic<bool> v_drop_{false};
     std::atomic<uint32_t> v_dropped_{0};
+
+    // 解码器停摆检测: 最后解码输出帧的 steady 时间戳 (ms)
+    static int64_t steadyMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    std::atomic<int64_t> lastDecMs_{0};
+    std::atomic<bool> spsChanged_{false};   // handler 检测到 SPS 参数集变化 -> 主循环重建
 
     // Annex-B 流中是否含关键帧 NAL (IDR=5 / SPS=7)
     static bool hasKeyframeNal(const uint8_t* data, size_t len) {
@@ -388,6 +400,16 @@ public:
                 vdepack_->incoming(one, send_);
                 for (auto &f : one)
                     if (!f->empty()) {
+                        // SPS 参数集变化检测: 浏览器分辨率切换 (640x360<->1280x720) 的先兆。
+                        // rkvdec2 对运行中分辨率切换极脆弱 (task timeout -> reset -> 停摆 20s+)。
+                        // 变化即刻通知主循环重建管道, 比等停摆看门狗快得多 (~2s vs ~10s)。
+                        uint32_t sh = spsHash(reinterpret_cast<const uint8_t*>(f->data()), f->size());
+                        if (sh) {
+                            if (haveSps_ && sh != lastSps_)
+                                media_->spsChanged_.store(true);
+                            lastSps_ = sh;
+                            haveSps_ = true;
+                        }
                         // 决定性实测结论: 带 PTS(33ms 递增)时 mppvideodec 按 PTS 节流输出
                         // (30fps 输入仅 7fps 输出 -> 慢动作+延迟持续累积);
                         // 无 PTS 按到达顺序全速解码 (gst-launch 节奏实验: 29fps 正常)。
@@ -413,6 +435,8 @@ public:
         v_last_seq_ = 0;
         v_have_seq_ = false;
         have_sr_ = false;
+        haveSps_ = false;
+        lastSps_ = 0;
         sr_ntp_ = sr_rtpts_ = 0;
         v_pending_ts_ = 0;
         v_pending_arrive_ = 0;
@@ -649,6 +673,23 @@ private:
     std::thread rembThread_;
     std::atomic<bool> rembRun_{false};
     std::shared_ptr<rtc::Track> vtrack_;   // track 级 RTCP 发送路径
+
+    // SPS 参数集跟踪 (分辨率切换检测)
+    uint32_t lastSps_ = 0;
+    bool haveSps_ = false;
+
+    // SPS NAL (type=7) 的前 24 字节 FNV hash; 无 SPS 返回 0
+    static uint32_t spsHash(const uint8_t* d, size_t n) {
+        for (size_t i = 0; i + 4 < n; ++i) {
+            if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 1 && (d[i+3] & 0x1F) == 7) {
+                size_t l = std::min<size_t>(24, n - (i + 3));
+                uint32_t h = 2166136261u;
+                for (size_t j = 0; j < l; ++j) { h ^= d[i + 3 + j]; h *= 16777619u; }
+                return h;
+            }
+        }
+        return 0;
+    }
 };
 
 // ----------------------------------------------------------------------------
@@ -974,7 +1015,8 @@ int main(int argc, char* argv[]) {
     auto lastD = media.dec_frames.load();
     auto lastT = std::chrono::steady_clock::now();
     int stuckCnt = 0;
-    int stuckDecCnt = 0;
+    uint64_t vLastFast = 0;      // 高频输入活跃检测
+    int64_t lastInputMs = 0;
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         g_main_context_iteration(nullptr, FALSE);   // 派发总线消息
@@ -1012,23 +1054,32 @@ int main(int argc, char* argv[]) {
             } else {
                 stuckCnt = 0;
             }
-            // 解码器停摆自愈: 输入正常但解码输出连续 4 个周期(8s)为 0 -> 重建管道。
-            // (实测: 浏览器分辨率切换 640x360<->1280x720 时 rkvdec2 slot 冲突 -> task timeout
-            //  -> reset 序列后长期停摆; 此时 mpp 吞帧不吐, appsrc 积压为 0, 上面的积压检测失效)
-            if (v - lastV > 0 && d == lastD) {
-                stuckDecCnt++;
-                if (stuckDecCnt >= 4) {
-                    std::cout << "[qos] 解码器停摆(输入正常, 解码输出连续8s为0), 自动重建管道" << std::endl;
-                    media.restart();
-                    stuckDecCnt = 0;
-                }
-            } else {
-                stuckDecCnt = 0;
-            }
-            // 统计基线从 media 重新读取 (restart 会重置计数, 直接用本地旧值会产生负数)
             lastV = media.v_frames.load(); lastA = media.a_frames.load();
             lastVB = media.v_bytes.load(); lastAB = media.a_bytes.load();
             lastD = media.dec_frames.load(); lastT = now;
+        }
+
+        // ---- 高频停摆检查 (每 100ms, 独立于 2s 统计周期) ----
+        // 层1: SPS 参数集变化 (分辨率切换先兆) -> 即刻重建 (总恢复 ~2s)
+        // 层2: 输入活跃但 3s 无解码输出 -> 重建 (兜底; 原 8s 缩短到 3s)
+        int64_t nowMs = MediaPipeline::steadyMs();
+        uint64_t vNow = media.v_frames.load();
+        if (vNow != vLastFast) { vLastFast = vNow; lastInputMs = nowMs; }
+
+        if (media.spsChanged_.exchange(false)) {
+            std::cout << "[qos] 检测到 SPS 参数集变化 (浏览器分辨率切换), 即刻重建管道" << std::endl;
+            media.restart();
+            player.requestKeyframe();   // 立即请求关键帧加速出图
+            vLastFast = media.v_frames.load();
+            lastInputMs = MediaPipeline::steadyMs();
+        } else if (media.lastDecMs_.load() != 0
+                   && nowMs - lastInputMs < 2000            // 输入仍活跃
+                   && nowMs - media.lastDecMs_.load() > 3000) {  // 3s 无解码输出
+            std::cout << "[qos] 解码器停摆(输入活跃, 3s 无解码输出), 自动重建管道" << std::endl;
+            media.restart();
+            player.requestKeyframe();
+            vLastFast = media.v_frames.load();
+            lastInputMs = MediaPipeline::steadyMs();
         }
     }
     std::cout << "[init] 退出" << std::endl;
