@@ -137,13 +137,19 @@ echo 0 | sudo tee /sys/class/backlight/backlight-dsi/bl_power   # 亮屏
 
 ## 五、磁盘/日志维护
 
-- rootfs（/dev/mmcblk0p6，6.9G）曾到 91%，journald 清理后 89%：
-  ```bash
-  sudo journalctl --vacuum-size=50M
-  df -h /
-  ```
-- RTW WiFi 驱动每 2 秒刷 dmesg（H2C debug 日志），属驱动行为，可忽略
+- **2026-09-08 大清理**（rootfs 92% → 77%，释放 ~1.1G），完整记录在板卡
+  `/userdata/archive/cleanup-2026-09-08.log`。要点：
+  - **转移至 `/userdata/archive/`（/userdata 分区 47G 空闲，与 rootfs 物理分离）**：
+    root-libdatachannel 202M、elf-env 220M、pyenv/dot-pyenv 34M、webrtc 15M、root-Desktop 8.6M、
+    rtc-backup（main.cpp 6 个历史版本 + 旧日志）1.6M
+  - **删除**：/var/log 三日志清空 502M、/userdata/rtc/__pycache__
+  - **RTW 日志根治**：`/etc/rsyslog.d/01-rtw-filter.conf` 过滤 RTW/rtl8821c/H2C 消息（kern.log 已零增长）
+  - **logrotate 限流**：`/etc/logrotate.d/rsyslog-sizecap` 三日志 size 50M / rotate 2 / compress
+  - **pipewire/wireplumber/pipewire-pulse 已 global mask**（崩溃循环刷 syslog ~230B/s，桌面组件无桌面时无用）
+  - 残余 syslog 增速 ~100B/s（root 用户实例启动消息等），logrotate 兜底，无需再处理
+- rootfs 常态检查：`df -h /`（>90% 需清理）
 - tcpdump 已安装（抓包诊断 RTCP：`sudo tcpdump -i wlan0 -n udp -w /tmp/x.pcap`，媒体走 wlan0，eth0 为 DOWN）
+- 重编 libdatachannel 时需从 `/userdata/archive/root-libdatachannel` 移回 `/root/libdatachannel`
 
 ## 六、关键部署位置
 
