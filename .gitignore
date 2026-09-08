@@ -20,3 +20,8 @@ _probe_out.txt
 node_modules/
 __pycache__/
 *.pyc
+
+# ===== temp diag scripts / captures (local only) =====
+_*.py
+*.pcap
+*.h264

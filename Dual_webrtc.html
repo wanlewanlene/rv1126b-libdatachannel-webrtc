@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>双端 WebRTC — 板卡画面 + 本地推流</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+        background: #14161a; color: #e6e8eb;
+        font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        display: flex; flex-direction: column; height: 100vh;
+    }
+    .toolbar {
+        display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+        background: #1e2228; border-bottom: 1px solid #2c313a; flex-wrap: wrap;
+    }
+    .toolbar label { font-size: 14px; color: #9aa3ad; white-space: nowrap; }
+    .toolbar input {
+        background: #0f1115; border: 1px solid #3a414b; color: #e6e8eb;
+        border-radius: 6px; padding: 7px 10px; font-size: 14px; outline: none;
+    }
+    #ipInput { width: 150px; }
+    #portInput { width: 60px; }
+    #fwdRoom { width: 90px; }
+    #revRoom { width: 90px; }
+    .toolbar button {
+        border: none; color: #fff; padding: 8px 16px; border-radius: 6px;
+        font-size: 14px; cursor: pointer; transition: background .15s;
+    }
+    #allBtn { background: #2f6fed; }
+    #allBtn:hover { background: #3d7bf5; }
+    #fwdBtn { background: #238636; }
+    #fwdBtn:hover { background: #2ea043; }
+    #revBtn { background: #8957e5; }
+    #revBtn:hover { background: #9e6aeb; }
+    #stopBtn { background: #c0392b; }
+    #stopBtn:hover { background: #d54b3a; }
+    .toolbar button:disabled { background: #3a414b; cursor: not-allowed; }
+    .main { flex: 1; display: flex; gap: 16px; padding: 16px; overflow: auto; }
+    .panel {
+        flex: 1; min-width: 320px; background: #1a1d23; border: 1px solid #2c313a;
+        border-radius: 10px; padding: 12px; display: flex; flex-direction: column;
+    }
+    .panel h3 { font-size: 15px; font-weight: 600; margin-bottom: 8px; color: #c9d1d9; }
+    .panel h3 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                     background: #484f58; margin-right: 8px; vertical-align: middle; }
+    .panel h3 .dot.on { background: #3fb950; }
+    .panel h3 .dot.err { background: #f85149; }
+    video {
+        width: 100%; max-height: 42vh; background: #000; border-radius: 8px;
+        box-shadow: 0 4px 24px rgba(0,0,0,.5); object-fit: contain;
+    }
+    .status { font-size: 13px; color: #8b949e; margin: 8px 0; min-height: 18px; }
+    .status.connected { color: #3fb950; }
+    .status.error { color: #f85149; }
+    .metrics {
+        display: flex; gap: 12px; margin-top: 6px; font-size: 12px; color: #9aa3ad;
+        background: #0f1115; border: 1px solid #2c313a; border-radius: 6px; padding: 8px 10px;
+    }
+    .metrics div b { color: #e6e8eb; font-weight: 600; }
+    .hint { font-size: 12px; color: #6e7681; margin-top: 8px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+    <label>板卡IP</label><input id="ipInput" type="text" value="192.168.137.184">
+    <label>信令端口</label><input id="portInput" type="text" value="8080">
+    <label>观看房间</label><input id="fwdRoom" type="text" value="cam1">
+    <label>推流房间</label><input id="revRoom" type="text" value="reverse1">
+    <button id="allBtn">全部开始</button>
+    <button id="fwdBtn">仅观看板卡</button>
+    <button id="revBtn">仅推流到板卡</button>
+    <button id="stopBtn" disabled>全部停止</button>
+</div>
+
+<div class="main">
+    <!-- 正向: 板卡摄像头 -> 浏览器 -->
+    <div class="panel">
+        <h3><span class="dot" id="fwdDot"></span>正向：板卡摄像头 → 浏览器</h3>
+        <video id="remoteVideo" autoplay playsinline muted></video>
+        <div class="status" id="fwdStatus">未连接</div>
+        <div class="metrics">
+            <div>帧率 <b id="fwdFps">--</b></div>
+            <div>分辨率 <b id="fwdRes">--</b></div>
+            <div>延迟 <b id="fwdLat">--</b>ms</div>
+            <div>码率 <b id="fwdBr">--</b>kbps</div>
+        </div>
+        <div class="hint">板端 rv1126b_webrtc_push 推流；本页以 viewer 身份接收。音频自动播放，如需可静音。</div>
+    </div>
+
+    <!-- 反向: 浏览器 -> 板卡 -->
+    <div class="panel">
+        <h3><span class="dot" id="revDot"></span>反向：浏览器 → 板卡（MIPI 屏播放）</h3>
+        <video id="localVideo" autoplay playsinline muted></video>
+        <div class="status" id="revStatus">未连接</div>
+        <div class="metrics">
+            <div>发送 <b id="revSend">--</b></div>
+            <div>采集 <b id="revCap">--</b></div>
+        </div>
+        <div class="hint">采集 1280x720@30；answer 后锁定 maxBitrate 3M + maintain-resolution；板端 REMB 驱动码率爬升。推流期间板卡屏显示该画面（按 Q 键可退出显示回桌面）。</div>
+    </div>
+</div>
+
+<audio id="remoteAudio" autoplay playsinline></audio>
+
+<script>
+const $ = id => document.getElementById(id);
+const ipInput = $('ipInput'), portInput = $('portInput');
+const fwdRoom = $('fwdRoom'), revRoom = $('revRoom');
+const remoteVideo = $('remoteVideo'), localVideo = $('localVideo'), remoteAudio = $('remoteAudio');
+
+// ============ 状态 ============
+let fwd = { pc: null, ws: null, wsUrl: '' };     // 正向(收流)
+let rev = { pc: null, ws: null, stream: null, senders: null, lastBytes: 0, lastTs: 0, timer: null };
+
+function wsUrl() { return `ws://${ipInput.value.trim()}:${portInput.value.trim()}`; }
+function iceCfg() {
+    return { iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'turn:' + (ipInput.value.trim() || '192.168.137.184') + ':3478',
+          username: 'webrtc', credential: 'webrtc123' }
+    ]};
+}
+function setStatus(el, text, cls) { el.textContent = text; el.className = 'status' + (cls ? ' ' + cls : ''); }
+function dot(id, state) { $(id).className = 'dot' + (state === 'on' ? ' on' : state === 'err' ? ' err' : ''); }
+
+// ============ 正向: 观看板卡 ============
+function startForward() {
+    stopForward();
+    const room = fwdRoom.value.trim() || 'cam1';
+    setStatus($('fwdStatus'), '连接信令...');
+    dot('fwdDot', '');
+
+    fwd.pc = new RTCPeerConnection(iceCfg());
+    fwd.pc.ontrack = (e) => {
+        const s = e.streams[0];
+        if (e.track.kind === 'video') { remoteVideo.srcObject = s; setStatus($('fwdStatus'), '视频已连接', 'connected'); }
+        else if (e.track.kind === 'audio') { remoteAudio.srcObject = s; remoteAudio.play().catch(()=>{}); }
+        // 低延迟: 视频 jitter 40ms / 音频 playout 60ms
+        try {
+            const rcv = fwd.pc.getReceivers().find(r => r.track === e.track);
+            if (rcv) {
+                if (e.track.kind === 'audio' && rcv.playoutDelayHint !== undefined) rcv.playoutDelayHint = 0.06;
+                if (e.track.kind === 'video' && rcv.jitterBufferTarget !== undefined) rcv.jitterBufferTarget = 0.04;
+            }
+        } catch (err) {}
+    };
+    fwd.pc.onconnectionstatechange = () => {
+        const st = fwd.pc.connectionState;
+        if (st === 'connected') { setStatus($('fwdStatus'), '已连接', 'connected'); dot('fwdDot', 'on'); }
+        else if (st === 'failed' || st === 'disconnected') { setStatus($('fwdStatus'), '连接: ' + st, 'error'); dot('fwdDot', 'err'); }
+    };
+    fwd.pc.onicecandidate = (e) => {
+        if (e.candidate && fwd.ws && fwd.ws.readyState === WebSocket.OPEN)
+            fwd.ws.send(JSON.stringify({ type: 'ice', room, candidate: e.candidate.candidate, mid: e.candidate.sdpMid }));
+    };
+
+    fwd.ws = new WebSocket(wsUrl());
+    fwd.ws.onopen = () => {
+        setStatus($('fwdStatus'), '已连信令, 加入 ' + room);
+        fwd.ws.send(JSON.stringify({ type: 'viewer_join', room }));
+    };
+    fwd.ws.onmessage = async (ev) => {
+        let m; try { m = JSON.parse(ev.data); } catch (err) { return; }
+        if (m.type === 'offer') {
+            try {
+                await fwd.pc.setRemoteDescription({ type: 'offer', sdp: m.sdp });
+                const ans = await fwd.pc.createAnswer();
+                await fwd.pc.setLocalDescription(ans);
+                fwd.ws.send(JSON.stringify({ type: 'answer', room, sdp: ans.sdp }));
+                setStatus($('fwdStatus'), '已应答, 等待媒体...');
+                startFwdStats();
+            } catch (err) { setStatus($('fwdStatus'), 'offer 处理失败: ' + err.message, 'error'); }
+        } else if (m.type === 'ice' && m.candidate) {
+            try { await fwd.pc.addIceCandidate({ candidate: m.candidate, sdpMid: m.mid }); } catch (err) {}
+        }
+    };
+    fwd.ws.onerror = () => setStatus($('fwdStatus'), '信令错误', 'error');
+}
+
+let fwdLastFrames = null, fwdLastT = 0;
+function startFwdStats() {
+    clearInterval(fwd.timer);
+    fwd.timer = setInterval(async () => {
+        if (!fwd.pc || fwd.pc.connectionState !== 'connected') return;
+        try {
+            const st = await fwd.pc.getStats();
+            let frames = null, jitD = 0, jitC = 0, rtt = 0, res = '', br = 0, lastBr = 0, lastTs = 0;
+            st.forEach(v => {
+                if (v.type === 'inbound-rtp' && v.kind === 'video') {
+                    frames = v.framesDecoded; jitD = v.jitterBufferDelay || 0; jitC = v.jitterBufferEmittedCount || 0;
+                    if (v.frameWidth) res = v.frameWidth + 'x' + v.frameHeight;
+                    br = v.bytesReceived || 0;
+                }
+                if (v.type === 'candidate-pair' && v.nominated && v.currentRoundTripTime != null) rtt = v.currentRoundTripTime * 1000;
+            });
+            if (frames == null) return;
+            const now = performance.now();
+            if (fwdLastFrames != null && now > fwdLastT) {
+                const fps = (frames - fwdLastFrames) / ((now - fwdLastT) / 1000);
+                $('fwdFps').textContent = Math.round(fps);
+            }
+            if (lastTs && br) {
+                const kbps = Math.round((br - lastBr) * 8 / (now - lastTs));
+                $('fwdBr').textContent = kbps;
+            }
+            lastBr = br; lastTs = now;
+            fwdLastFrames = frames; fwdLastT = now;
+            $('fwdRes').textContent = res || '--';
+            const jitMs = jitC > 0 ? (jitD / jitC) * 1000 : 0;
+            $('fwdLat').textContent = Math.round(rtt + jitMs);
+        } catch (err) {}
+    }, 2000);
+}
+
+function stopForward() {
+    clearInterval(fwd.timer);
+    if (fwd.ws) { fwd.ws.onmessage = null; fwd.ws.close(); fwd.ws = null; }
+    if (fwd.pc) { fwd.pc.ontrack = null; fwd.pc.onicecandidate = null; fwd.pc.close(); fwd.pc = null; }
+    remoteVideo.srcObject = null; remoteAudio.srcObject = null;
+    setStatus($('fwdStatus'), '已停止'); dot('fwdDot', '');
+    $('fwdFps').textContent = '--'; $('fwdRes').textContent = '--';
+    $('fwdLat').textContent = '--'; $('fwdBr').textContent = '--';
+}
+
+// ============ 反向: 推流到板卡 ============
+async function startReverse() {
+    stopReverse();
+    const room = revRoom.value.trim() || 'reverse1';
+    setStatus($('revStatus'), '请求摄像头/麦克风...');
+    dot('revDot', '');
+
+    rev.stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    localVideo.srcObject = rev.stream;
+    localVideo.muted = true;
+    $('revCap').textContent = (localVideo.videoWidth || '?') + 'x' + (localVideo.videoHeight || '?');
+
+    rev.pc = new RTCPeerConnection(iceCfg());
+    rev.senders = {};
+    rev.stream.getTracks().forEach(t => { rev.senders[t.kind] = rev.pc.addTrack(t, rev.stream); });
+
+    rev.pc.onicecandidate = (e) => {
+        if (e.candidate && rev.ws && rev.ws.readyState === WebSocket.OPEN)
+            rev.ws.send(JSON.stringify({ type: 'ice', room, candidate: e.candidate.candidate, mid: e.candidate.sdpMid }));
+    };
+    rev.pc.onconnectionstatechange = () => {
+        const st = rev.pc.connectionState;
+        if (st === 'connected') { setStatus($('revStatus'), '已连接: 板卡正在接收播放', 'connected'); dot('revDot', 'on'); }
+        else if (st === 'failed' || st === 'disconnected') { setStatus($('revStatus'), '连接: ' + st, 'error'); dot('revDot', 'err'); }
+    };
+
+    rev.ws = new WebSocket(wsUrl());
+    rev.ws.onopen = () => {
+        rev.ws.send(JSON.stringify({ type: 'streamer_join', room }));
+        setStatus($('revStatus'), '已连信令, 请求板卡 offer...');
+        setTimeout(() => rev.ws && rev.ws.send(JSON.stringify({ type: 'request_offer', room })), 300);
+    };
+    rev.ws.onmessage = async (ev) => {
+        let m; try { m = JSON.parse(ev.data); } catch (err) { return; }
+        if (m.type === 'offer') {
+            try {
+                await rev.pc.setRemoteDescription({ type: 'offer', sdp: m.sdp });
+                const ans = await rev.pc.createAnswer();
+                await rev.pc.setLocalDescription(ans);
+                rev.ws.send(JSON.stringify({ type: 'answer', room, sdp: ans.sdp }));
+                setStatus($('revStatus'), '已应答, 建立连接中...');
+                await forceHd();
+                startRevStats();
+            } catch (err) { setStatus($('revStatus'), '应答失败: ' + err.message, 'error'); }
+        } else if (m.type === 'ice' && m.candidate) {
+            try { await rev.pc.addIceCandidate({ candidate: m.candidate, sdpMid: m.mid }); } catch (err) {}
+        }
+    };
+    rev.ws.onerror = () => setStatus($('revStatus'), '信令错误', 'error');
+}
+
+// 锁定源分辨率 + 放开码率上限 (板端无带宽反馈时浏览器会保守降到 640x360@280k)
+async function forceHd() {
+    const vs = rev.senders && rev.senders['video'];
+    if (!vs) return;
+    try {
+        const p = vs.getParameters();
+        if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+        p.encodings[0].maxBitrate = 3000000;
+        p.encodings[0].scaleResolutionDownBy = 1.0;
+        p.encodings[0].degradationPreference = 'maintain-resolution';
+        await vs.setParameters(p);
+    } catch (err) { console.warn('setParameters', err); }
+}
+
+function startRevStats() {
+    clearInterval(rev.timer);
+    rev.lastBytes = 0; rev.lastTs = 0;
+    rev.timer = setInterval(async () => {
+        if (!rev.pc) return;
+        try {
+            const st = await rev.pc.getStats();
+            st.forEach(r => {
+                if (r.type === 'outbound-rtp' && r.kind === 'video') {
+                    let kbps = 0;
+                    if (rev.lastTs && r.bytesSent) kbps = Math.round((r.bytesSent - rev.lastBytes) * 8 / (r.timestamp - rev.lastTs));
+                    rev.lastBytes = r.bytesSent; rev.lastTs = r.timestamp;
+                    $('revSend').textContent = (r.frameWidth || '?') + 'x' + (r.frameHeight || '?')
+                        + ' @ ' + Math.round(r.framesPerSecond || 0) + 'fps, ' + kbps + 'kbps';
+                }
+            });
+        } catch (err) {}
+    }, 2000);
+}
+
+function stopReverse() {
+    clearInterval(rev.timer);
+    if (rev.ws) { rev.ws.onmessage = null; rev.ws.close(); rev.ws = null; }
+    if (rev.pc) { rev.pc.onicecandidate = null; rev.pc.close(); rev.pc = null; }
+    if (rev.stream) { rev.stream.getTracks().forEach(t => t.stop()); rev.stream = null; }
+    localVideo.srcObject = null; rev.senders = null;
+    setStatus($('revStatus'), '已停止'); dot('revDot', '');
+    $('revSend').textContent = '--'; $('revCap').textContent = '--';
+}
+
+// ============ 按钮 ============
+function updateBtns() {
+    const any = rev.stream || fwd.pc;
+    $('stopBtn').disabled = !any;
+}
+$('allBtn').addEventListener('click', async () => {
+    startForward();
+    try { await startReverse(); } catch (e) { setStatus($('revStatus'), '启动失败: ' + e.message, 'error'); }
+    updateBtns();
+});
+$('fwdBtn').addEventListener('click', () => { startForward(); updateBtns(); });
+$('revBtn').addEventListener('click', async () => {
+    try { await startReverse(); } catch (e) { setStatus($('revStatus'), '启动失败: ' + e.message, 'error'); }
+    updateBtns();
+});
+$('stopBtn').addEventListener('click', () => { stopForward(); stopReverse(); updateBtns(); });
+
+window.addEventListener('DOMContentLoaded', () => {
+    const hn = location.hostname;
+    if (hn && hn !== 'localhost' && hn !== '127.0.0.1' && location.protocol.startsWith('http'))
+        ipInput.value = hn;
+});
+</script>
+</body>
+</html>
