@@ -362,5 +362,52 @@
             }
         });
     </script>
+
+<div class="toolbar" id="motorPanel" style="background:#161b22;border-top:1px solid #2c313a">
+    <label>电机</label>
+    <label>A</label><input id="aCtl" type="number" value="300" style="width:70px" title="rpm(设速) 或 千分比(开环)">
+    <button onclick="mcmd('A','rpm')">A设速</button>
+    <button onclick="mcmd('A','speed')">A开环</button>
+    <button onclick="mcmd('A','stop')">A停</button>
+    <button onclick="mcmd('A','brake')">A刹</button>
+    <label>B</label><input id="bCtl" type="number" value="200" style="width:70px">
+    <button onclick="mcmd('B','rpm')">B设速</button>
+    <button onclick="mcmd('B','speed')">B开环</button>
+    <button onclick="mcmd('B','stop')">B停</button>
+    <button onclick="mcmd('B','brake')">B刹</button>
+    <button onclick="mrestart()" style="background:#b26a00">重启推流</button>
+    <span id="motorStatus" style="margin-left:auto;font-size:12px;color:#8b949e;font-family:monospace">电机面板初始化…</span>
+</div>
+<script>
+(function () {
+    const MAPI = 'http://' + location.hostname + ':8081';
+    window.mcmd = function (m, op) {
+        const el = document.getElementById(m.toLowerCase() + 'Ctl');
+        const v = el ? el.value : '';
+        fetch(MAPI + '/api/cmd?m=' + m + '&op=' + op + '&v=' + encodeURIComponent(v))
+            .then(r => r.json()).then(() => mrefresh()).catch(() => {});
+    };
+    function mrefresh() {
+        fetch(MAPI + '/api/status').then(r => r.json()).then(j => {
+            const el = document.getElementById('motorStatus');
+            if (el && j && j.A && j.B) {
+                el.textContent = 'A[' + j.A.mode + ']duty=' + j.A.duty + ' cnt=' + j.A.total +
+                    '  B[' + j.B.mode + ']duty=' + j.B.duty + ' cnt=' + j.B.total;
+                el.style.color = '#3fb950';
+            }
+        }).catch(() => {
+            const el = document.getElementById('motorStatus');
+            if (el) { el.textContent = '电机网桥不可达(:8081)'; el.style.color = '#f85149'; }
+        });
+    }
+    window.mrestart = function () {
+        fetch(MAPI + '/api/push_restart').then(() => setTimeout(mrefresh, 1500)).catch(() => {});
+    };
+    setInterval(mrefresh, 1000);
+    mrefresh();
+})();
+</script>
 </body>
+</html>
+
 </html>

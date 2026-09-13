@@ -1,0 +1,13 @@
+[Unit]
+Description=Motor web bridge (HTTP :8081 -> motor_ctl socket)
+After=motor-ctl.service
+Wants=motor-ctl.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /userdata/rtc/motor_web.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

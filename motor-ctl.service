@@ -1,0 +1,16 @@
+[Unit]
+Description=MG310+TB6612 motor control daemon (motor_ctl)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 -u /userdata/rtc/motor_ctl.py --pwm-hz 500
+Restart=always
+RestartSec=2
+# 停止时给安全退出（PWM=0/刹车/STBY待机）留时间
+TimeoutStopSec=5
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
