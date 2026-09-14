@@ -8,6 +8,12 @@ Type=simple
 ExecStart=/usr/bin/python3 -u /userdata/rtc/motor_web.py
 Restart=always
 RestartSec=2
+# 不做启动限流：即使短时间反复退出也持续拉起
+StartLimitIntervalSec=0
+StartLimitBurst=0
+# 日志落盘便于排查（含上一轮为何退出）
+StandardOutput=append:/tmp/motor_web.log
+StandardError=append:/tmp/motor_web.log
 
 [Install]
 WantedBy=multi-user.target

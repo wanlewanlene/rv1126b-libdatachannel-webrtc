@@ -23,5 +23,12 @@ __pycache__/
 
 # ===== temp diag scripts / captures (local only) =====
 _*.py
+_tunnel_out.txt
+_tunnel_err.txt
+_cf_out.txt
+_cf_err.txt
+
+# ===== 隧道客户端二进制（54MB，按需下载） =====
+cloudflared.exe
 *.pcap
 *.h264

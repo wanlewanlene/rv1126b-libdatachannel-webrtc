@@ -220,6 +220,10 @@
         }
 
         function getWsUrl() {
+            // 经 HTTPS 隧道（外网）访问时：信令走同源 /ws（由 3000 端口提供）
+            if (location.protocol === 'https:') {
+                return `wss://${location.host}/ws`;
+            }
             const ip = ipInput.value.trim();
             const port = portInput.value.trim();
             return `ws://${ip}:${port}`;
@@ -380,7 +384,7 @@
 </div>
 <script>
 (function () {
-    const MAPI = 'http://' + location.hostname + ':8081';
+    const MAPI = location.origin + '/motor';   // 同源电机接口（由 3000 端口反代到 8081）
     window.mcmd = function (m, op) {
         const el = document.getElementById(m.toLowerCase() + 'Ctl');
         const v = el ? el.value : '';
