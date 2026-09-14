@@ -148,11 +148,32 @@ wss.on('connection', (ws) => {
 const path = require('path');
 app.use(express.static(__dirname));
 
+// 电机网桥反向代理: /motor/* -> 127.0.0.1:8081/*
+// 目的：外网经 HTTPS 隧道访问时，电机接口与页面同源，无需额外暴露 8081 端口
+const http = require('http');
+app.use('/motor', (req, res) => {
+    const target = req.originalUrl.replace(/^\/motor/, '') || '/';
+    const pReq = http.request(
+        { host: '127.0.0.1', port: 8081, path: target, method: req.method, headers: req.headers },
+        (pRes) => {
+            res.writeHead(pRes.statusCode, pRes.headers);
+            pRes.pipe(res);
+        });
+    pReq.on('error', () => res.status(502).json({ err: 'motor bridge unreachable' }));
+    req.pipe(pReq);
+});
+
+// HTTP 与 WebSocket 共用 3000 端口（/ws 路径），便于单条 HTTPS 隧道穿透
+const httpServer = http.createServer(app);
+const wssHttp = new WebSocket.Server({ server: httpServer, path: '/ws' });
+wssHttp.on('connection', (ws) => { wss.emit('connection', ws); });
+
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'Browser_client.html'));
 });
 
-app.listen(HTTP_PORT, () => {
+httpServer.listen(HTTP_PORT, () => {
     console.log(`Signaling server: HTTP ${HTTP_PORT}, WebSocket ${WS_PORT}`);
+    console.log(`同源信令(隧道用): ws(s)://<host>/ws   电机代理: /motor/api/...`);
     console.log(`浏览器访问 http://<板卡IP>:${HTTP_PORT}/ 查看视频`);
 });
