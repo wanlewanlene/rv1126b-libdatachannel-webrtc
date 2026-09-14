@@ -1,6 +1,6 @@
 {
   "name": "rv1126b-webrtc-signaling",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "WebRTC signaling server for RV1126B (ELF board) low-latency video streaming",
   "main": "WebSocket.js",
   "scripts": {
