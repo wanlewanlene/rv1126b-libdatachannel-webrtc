@@ -1,0 +1,14 @@
+Release v1.1.3: reorganize workspace into docs/systemd/python/assets
+
+- Move all documentation into docs/ (BOARD_MAINTENANCE, CHANGELOG, MOTOR_*,
+  wiring guides) with directory README
+- Move systemd unit reference copies into systemd/ with README
+- Move Python production scripts into python/ (motor_ctl, motor_web,
+  motor_selftest, reverse_player, rtc_push_ctl) with README
+- Move static asset raw_640.png into assets/ with README
+- Keep build/runtime-coupled files at root: C++ sources (build.sh compiles
+  src in place), WebSocket.js + pages + package.json (express.static(__dirname),
+  main entry), build/start scripts, cloudflared.exe
+- Update internal references: release tool file list, deploy script upload
+  paths, docs pointing to previous root locations
+- Bump version to 1.1.3; record changes in docs/CHANGELOG.md

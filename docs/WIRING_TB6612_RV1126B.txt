@@ -10,8 +10,8 @@ TB6612 模块由外部 12V 电源直接供电，RV1126B 只提供 3.3V 控制信
 配套文件：
   MOTOR_MG310_TB6612_RV1126B.md     例程整理 / 线序 / 引脚依据
   MOTOR_SYSTEM_DESIGN_RV1126B.md    系统设计方案（12 章）
-  motor_ctl.py                      电机控制守护进程（引脚定义见文件头部 CFG）
-  motor_web.py                      HTTP 控制网桥（:8081，网页面板后端）
+  python/motor_ctl.py               电机控制守护进程（引脚定义见文件头部 CFG）
+  python/motor_web.py               HTTP 控制网桥（:8081，网页面板后端）
   motor-ctl.service / motor-web.service   systemd 服务
 
 

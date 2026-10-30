@@ -2,6 +2,18 @@
 
 版本号规则：`主版本.次版本.修订号`（x.y.z）；未特别指定时，每次发布在修订号上 +1。
 
+## v1.1.3 — 2026-10-30
+
+- **工程结构整理（无功能改动）**：按类别归档，文件内容不变、未删除任何文件
+  - `docs/`：全部文档（BOARD_MAINTENANCE / CHANGELOG / MOTOR_* / 接线说明）
+  - `systemd/`：服务单元参考副本（motor-ctl / motor-web）
+  - `python/`：Python 生产脚本（motor_ctl / motor_web / motor_selftest / reverse_player / rtc_push_ctl）
+  - `assets/`：静态资源（raw_640.png）
+  - `debug/`：调试与被 `.gitignore` 忽略的诊断资料（不入库）
+- 根目录仅保留存在硬路径耦合的文件：C++ 源码（build.sh 同目录编译）、`WebSocket.js` + 页面 + `package.json`（`express.static(__dirname)`）、构建/启动脚本与 `cloudflared.exe`
+- 同步修正内部引用：发布脚本文件清单、部署脚本上传路径、文档中的文件位置说明
+- 版本号自增：v1.1.2 → v1.1.3
+
 ## v1.1.2 — 2026-09-14
 
 - 按版本规则自增修订号（v1.1.1 → v1.1.2），同步更新 `package.json` 与本人 CHANGELOG

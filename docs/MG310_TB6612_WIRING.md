@@ -97,7 +97,7 @@ MG310 数据手册明确："编码器带上拉输出，默认上拉到供电 VCC
 
 ## 7. 功能实现（motor_ctl.py）
 
-见工程根 `motor_ctl.py`：
+见 `python/motor_ctl.py`：
 
 ```bash
 sudo python3 motor_ctl.py --status              # 查看状态

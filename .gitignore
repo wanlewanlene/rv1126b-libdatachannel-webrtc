@@ -21,6 +21,9 @@ node_modules/
 __pycache__/
 *.pyc
 
+# ===== 调试资料目录（脚本/日志/抓包，统一归档，不入库） =====
+debug/
+
 # ===== temp diag scripts / captures (local only) =====
 _*.py
 _tunnel_out.txt
