@@ -2,6 +2,34 @@
 
 版本号规则：`主版本.次版本.修订号`（x.y.z）；未特别指定时，每次发布在修订号上 +1。
 
+## v1.2.0 — 2026-11-15
+
+**模块化重构（目标：功能行为不变，仅调整结构与去重）**
+
+- 目录重组：
+  - `cpp/`：`main.cpp`、`reverse_player.cpp`（原仓库根）
+  - `attic/`：`Video_capture_and_encoding.cpp`、`WebRTC_Connection_Management.cpp`（未被编译的早期草稿，去空格重命名并加说明）
+  - `web/`：三个页面 + `web/assets/js/`（共享脚本，目录自包含便于整体部署）
+  - `assets/`：仅保留图片资源
+- Python 电机栈拆分（`python/motor_ctl.py` 481 行 → 11 个模块）：
+  `config / gpio / pwm / encoder / motor / control / protocol / server / client / app / __init__`；
+  `motor_ctl.py` 变为薄壳入口，**CLI、socket 协议、控制参数、状态 JSON 全部保持不变**
+- 消除重复代码：
+  - `motor_web.py` 改用 `motor.client.request()`（原自带 socket 实现）
+  - `motor_selftest.py` 改用 `motor.gpio.Gpio`（原自带 export/unexport/gpio_path）
+  - 页面电机面板 JS 抽为 `web/assets/js/motor-panel.js`（两页复用）
+  - STUN/TURN 与信令 URL 抽为 `web/assets/js/webrtc-config.js`（三页复用）
+  - 删除 `Reverse_pusher.html` 中被覆盖的重复 `ws.onopen`；清理两页重复的 `</html>`
+- 保持兼容：`express.static` 同时挂载仓库根与 `web/`，`/Browser_client.html` 等 URL 不变；
+  `build.sh` 源路径更新为 `cpp/main.cpp`
+- 等价性验证：用重构基线 tag 导出旧版 `motor_ctl.py`，在 Fake GPIO/PWM/Encoder 下对比
+  17 条命令解析、4 组目标各 36 拍速度环输出、开环方向/占空比、位置目标 —— 0 差异；
+  三个页面内联脚本与共享脚本通过 `node --check`，外部引用与 DOM 依赖检查通过
+- 留档：重构前 tag `refactor-baseline-v1.1.3` / 分支 `archive/pre-refactor-20261115`；
+  重构后 tag `refactor-v1.2.0`；仓库外 `_refactor_archive/` 保存前后 bundle 与工作树 zip
+- 说明：`cpp/` 两个单体文件本次未拆分（需板端工具链验证），计划见 `ARCHITECTURE.md` §6
+- 版本号：v1.1.3 → v1.2.0（结构调整属次版本变更）
+
 ## v1.1.3 — 2026-10-30
 
 - **工程结构整理（无功能改动）**：按类别归档，文件内容不变、未删除任何文件

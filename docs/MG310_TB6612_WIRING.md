@@ -95,16 +95,17 @@ MG310 数据手册明确："编码器带上拉输出，默认上拉到供电 VCC
 实测 `debug/pwm`：3 路已使能 PWM 全被内核占用（vdd-cpu / DSI 背光 / LCD 背光），其余 25 路设备树 disabled 且无 overlay 支持。
 因此软件先用"软件 PWM（GPIO 位翻转）"或 PCA9685，最终建议改 DTS 使能 `pwm3`（M1 复用 → GPIO5_C0~C7，正是本方案用到的引脚）。
 
-## 7. 功能实现（motor_ctl.py）
+## 7. 功能实现（python/motor/ 包）
 
-见 `python/motor_ctl.py`：
+入口 `python/motor_ctl.py`，实现在 `python/motor/`（职责划分见 `docs/ARCHITECTURE.md`）：
 
 ```bash
-sudo python3 motor_ctl.py --status              # 查看状态
-sudo python3 motor_ctl.py A speed 100           # A 电机 100（-1000~1000，千分比）
-sudo python3 motor_ctl.py A stop / brake        # 停止 / 刹车
-sudo python3 motor_ctl.py A pos 360             # 位置模式：转 360 度
-sudo python3 motor_ctl.py A rpm 40              # 闭环 40rpm（输出轴）
+sudo python3 motor_ctl.py                       # 启动守护进程（前台，需 root）
+sudo python3 motor_ctl.py --cmd "status"        # 双机状态 JSON
+sudo python3 motor_ctl.py --cmd "A speed 100"   # A 开环 100（-1000~1000，千分比）
+sudo python3 motor_ctl.py --cmd "A stop"        # 停止（滑行）；brake 为短接刹车
+sudo python3 motor_ctl.py --cmd "A pos 360"     # 位置模式：相对转 360 度
+sudo python3 motor_ctl.py --cmd "A rpm 40"      # 速度闭环 40rpm（输出轴）
 ```
 
 编码器换算（1:20.409、13ppr、4 倍频）：
