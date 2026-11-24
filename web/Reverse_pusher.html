@@ -95,6 +95,7 @@
         }
 
     </style>
+    <script src="assets/js/webrtc-config.js"></script>
 
 </head>
 
@@ -218,7 +219,7 @@
 
         function getWsUrl() {
 
-            return `ws://${ipInput.value.trim()}:${portInput.value.trim()}`;
+            return signalingUrl(ipInput.value.trim(), portInput.value.trim());
 
         }
 
@@ -301,17 +302,7 @@
 
             // 2) PeerConnection: 视频优先 H.264 (板卡 mppvideodec 硬解), 音频 Opus
 
-            pc = new RTCPeerConnection({
-
-                iceServers: [
-
-                    { urls: 'stun:stun.l.google.com:19302' },
-
-                    { urls: 'turn:' + (ipInput.value.trim() || '192.168.137.184') + ':3478', username: 'webrtc', credential: 'webrtc123' }
-
-                ]
-
-            });
+            pc = new RTCPeerConnection({ iceServers: iceServers(ipInput.value.trim()) });
 
 
 
@@ -351,14 +342,6 @@
             // 3) 信令: 作为 streamer 加入 reverse 房间
 
             ws = new WebSocket(getWsUrl());
-
-            ws.onopen = () => {
-
-                sendWs({ type: 'streamer_join', room });
-
-                setStatus('已连信令, 生成 offer...');
-
-            };
 
             ws.onmessage = async (e) => {
 

@@ -61,6 +61,7 @@
     .metrics div b { color: #e6e8eb; font-weight: 600; }
     .hint { font-size: 12px; color: #6e7681; margin-top: 8px; line-height: 1.5; }
 </style>
+<script src="assets/js/webrtc-config.js"></script>
 </head>
 <body>
 
@@ -116,16 +117,10 @@ let fwd = { pc: null, ws: null, wsUrl: '' };     // 正向(收流)
 let rev = { pc: null, ws: null, stream: null, senders: null, lastBytes: 0, lastTs: 0, timer: null };
 
 function wsUrl() {
-    // 经 HTTPS 隧道（外网）访问时：信令走同源 /ws（由 3000 端口提供）
-    if (location.protocol === 'https:') { return `wss://${location.host}/ws`; }
-    return `ws://${ipInput.value.trim()}:${portInput.value.trim()}`;
+    return signalingUrl(ipInput.value.trim(), portInput.value.trim());
 }
 function iceCfg() {
-    return { iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'turn:' + (ipInput.value.trim() || '192.168.137.184') + ':3478',
-          username: 'webrtc', credential: 'webrtc123' }
-    ]};
+    return { iceServers: iceServers(ipInput.value.trim()) };
 }
 function setStatus(el, text, cls) { el.textContent = text; el.className = 'status' + (cls ? ' ' + cls : ''); }
 function dot(id, state) { $(id).className = 'dot' + (state === 'on' ? ' on' : state === 'err' ? ' err' : ''); }
@@ -365,36 +360,6 @@ window.addEventListener('DOMContentLoaded', () => {
     <button onclick="mcmd('B','brake')">B刹</button>
     <span id="motorStatus" style="margin-left:auto;font-size:12px;color:#8b949e;font-family:monospace">电机面板初始化…</span>
 </div>
-<script>
-(function () {
-    const MAPI = location.origin + '/motor';   // 同源电机接口（由 3000 端口反代到 8081）
-    window.mcmd = function (m, op) {
-        const el = document.getElementById(m.toLowerCase() + 'Ctl');
-        const v = el ? el.value : '';
-        fetch(MAPI + '/api/cmd?m=' + m + '&op=' + op + '&v=' + encodeURIComponent(v))
-            .then(r => r.json()).then(() => mrefresh()).catch(() => {});
-    };
-    window.mrestart = function () {
-        fetch(MAPI + '/api/push_restart').then(() => setTimeout(mrefresh, 1500)).catch(() => {});
-    };
-    function mrefresh() {
-        fetch(MAPI + '/api/status').then(r => r.json()).then(j => {
-            const el = document.getElementById('motorStatus');
-            if (el && j && j.A && j.B) {
-                el.textContent = 'A[' + j.A.mode + ']duty=' + j.A.duty + ' rpm=' + (j.A.last_rpm || 0).toFixed(0) +
-                    '  B[' + j.B.mode + ']duty=' + j.B.duty + ' rpm=' + (j.B.last_rpm || 0).toFixed(0);
-                el.style.color = '#3fb950';
-            }
-        }).catch(() => {
-            const el = document.getElementById('motorStatus');
-            if (el) { el.textContent = '电机网桥不可达(:8081)'; el.style.color = '#f85149'; }
-        });
-    }
-    setInterval(mrefresh, 1000);
-    mrefresh();
-})();
-</script>
+<script src="assets/js/motor-panel.js"></script>
 </body>
-</html>
-
 </html>

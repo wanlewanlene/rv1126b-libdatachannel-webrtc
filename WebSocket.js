@@ -147,6 +147,8 @@ wss.on('connection', (ws) => {
 // 静态文件服务: 浏览器直接访问 http://板卡IP:3000/ 即可打开播放页面
 const path = require('path');
 app.use(express.static(__dirname));
+// 页面目录：web/（URL 仍为 /Browser_client.html 等，保持外部链接不变）
+app.use(express.static(path.join(__dirname, 'web')));
 
 // 电机网桥反向代理: /motor/* -> 127.0.0.1:8081/*
 // 目的：外网经 HTTPS 隧道访问时，电机接口与页面同源，无需额外暴露 8081 端口
@@ -169,7 +171,7 @@ const wssHttp = new WebSocket.Server({ server: httpServer, path: '/ws' });
 wssHttp.on('connection', (ws) => { wss.emit('connection', ws); });
 
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'Browser_client.html'));
+    res.sendFile(path.join(__dirname, 'web', 'Browser_client.html'));
 });
 
 httpServer.listen(HTTP_PORT, () => {
