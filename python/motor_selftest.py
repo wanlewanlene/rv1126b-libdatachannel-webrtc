@@ -19,31 +19,13 @@ import select
 import subprocess
 import time
 
-GPIO = "/sys/class/gpio"
+from motor.gpio import Gpio
+
 DEF_PAIRS = "176:182,177:183,178:184,179:185"
 
 
 def sh(cmd):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
-
-
-def gpio_path(n, name):
-    return "%s/gpio%d/%s" % (GPIO, n, name)
-
-
-def export(n):
-    if not os.path.isdir("%s/gpio%d" % (GPIO, n)):
-        with open("%s/export" % GPIO, "w") as f:
-            f.write(str(n))
-        time.sleep(0.05)
-
-
-def unexport(n):
-    try:
-        with open("%s/unexport" % GPIO, "w") as f:
-            f.write(str(n))
-    except Exception:
-        pass
 
 
 def do_info():
@@ -63,29 +45,25 @@ def do_loopback(pairs, cycles=20):
     for pair in pairs:
         out_n, in_n = [int(x) for x in pair.split(":")]
         res = {"pair": pair, "ok": False}
+        go = gi = None
         try:
-            export(out_n)
-            export(in_n)
-            with open(gpio_path(out_n, "direction"), "w") as f:
-                f.write("out")
-            with open(gpio_path(in_n, "direction"), "w") as f:
-                f.write("in")
-            with open(gpio_path(in_n, "edge"), "w") as f:
-                f.write("both")
+            go, gi = Gpio(out_n), Gpio(in_n)
+            go.dir("out")
+            gi.dir("in")
+            gi.edge("both")
             time.sleep(0.05)
-            fd = open(gpio_path(in_n, "value"), "r")
+            fd = gi.fd()
             os.set_blocking(fd.fileno(), False)
             fd.read()  # 清中断标志
             events = 0
             start = time.time()
             for i in range(cycles):
                 for v in (1, 0):
-                    with open(gpio_path(out_n, "value"), "w") as f:
-                        f.write(str(v))
+                    go.write(v)
                     time.sleep(0.02)
-                    lvl = open(gpio_path(in_n, "value")).read().strip()
-                    if lvl != str(v):
-                        res["level_mismatch"] = "cycle=%d expect=%d got=%s" % (i, v, lvl)
+                    got = gi.read()
+                    if got != bool(v):
+                        res["level_mismatch"] = "cycle=%d expect=%d got=%d" % (i, v, int(got))
             end = time.time()
             while time.time() - end < 0.2:
                 if select.select([fd], [], [], 0.05)[0]:
@@ -98,8 +76,9 @@ def do_loopback(pairs, cycles=20):
         except Exception as e:
             res["error"] = str(e)
         finally:
-            unexport(out_n)
-            unexport(in_n)
+            for g in (go, gi):
+                if g is not None:
+                    g.unexport()
         results.append(res)
         print("[loopback] %s -> %s" % (pair, "PASS" if res["ok"] else "FAIL %s" % res))
     return results
@@ -107,14 +86,12 @@ def do_loopback(pairs, cycles=20):
 
 def do_encoder(a_pin, b_pin, seconds):
     """统计 A 相边沿次数并按 B 相电平判方向（需手动转动电机或电机通电）"""
-    for p in (a_pin, b_pin):
-        export(p)
-        with open(gpio_path(p, "direction"), "w") as f:
-            f.write("in")
-    with open(gpio_path(a_pin, "edge"), "w") as f:
-        f.write("both")
+    ga, gb = Gpio(a_pin), Gpio(b_pin)
+    for g in (ga, gb):
+        g.dir("in")
+    ga.edge("both")
     time.sleep(0.05)
-    fd = open(gpio_path(a_pin, "value"), "r")
+    fd = ga.fd()
     os.set_blocking(fd.fileno(), False)
     fd.read()
     count = 0
@@ -124,9 +101,9 @@ def do_encoder(a_pin, b_pin, seconds):
             fd.seek(0)
             fd.read()
             count += 1
-    b_now = open(gpio_path(b_pin, "value")).read().strip()
-    unexport(a_pin)
-    unexport(b_pin)
+    b_now = str(int(gb.read()))
+    ga.unexport()
+    gb.unexport()
     r = {"a": a_pin, "b": b_pin, "seconds": seconds, "edges": count,
          "edges_per_sec": round(count / float(seconds), 1), "b_level_now": b_now}
     print("[encoder] A=%d B=%d edges=%d (%.1f/s)" % (a_pin, b_pin, count, count / float(seconds)))

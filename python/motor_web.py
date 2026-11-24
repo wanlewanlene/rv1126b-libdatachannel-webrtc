@@ -2,29 +2,27 @@
 # -*- coding: utf-8 -*-
 """motor_web：电机控制 HTTP 网桥（:8081 → /run/motor_ctl.sock）
 
+socket 通信由 motor.client 统一提供，本文件只负责 HTTP 路由与 JSON 包装。
+
 GET /api/status              → 电机状态 JSON
 GET /api/cmd?m=A&op=rpm&v=300 → 转发命令（op: speed/rpm/pos/stop/brake/stby）
+GET /api/push_restart        → 重启推流进程
+GET /ping                    → 存活探测
 """
 import json
 import os
-import socket
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
-SOCK = "/run/motor_ctl.sock"
+from motor.client import request
 
 
 def forward(cmd):
+    """转发一行命令到 motor_ctl 守护进程；失败时返回 JSON 错误体。"""
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(2)
-        s.connect(SOCK)
-        s.sendall(cmd.encode())
-        data = s.recv(4096).decode("utf-8", "ignore").strip()
-        s.close()
-        return data or "ok"
+        return request(cmd, timeout=2) or "ok"
     except OSError as e:
         return json.dumps({"err": str(e)}, ensure_ascii=False)
 
