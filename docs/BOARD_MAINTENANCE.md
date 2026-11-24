@@ -168,7 +168,7 @@ echo 0 | sudo tee /sys/class/backlight/backlight-dsi/bl_power   # 亮屏
 | 文件 | 位置 |
 |---|---|
 | 播放器二进制 | `/userdata/rtc/reverse_player_bin` |
-| 播放器源码 | `/userdata/rtc/reverse_player.cpp`（Windows 侧同名文件为源） |
+| 播放器源码 | `/userdata/rtc/reverse_player.cpp`（Windows 侧源：`cpp/reverse_player.cpp`） |
 | 推流页面 | `/userdata/rtc/server/Reverse_pusher.html` |
 | 信令 | `/userdata/rtc/server/WebSocket.js` |
 | libdatachannel | `/userdata/rtc/lib/libdatachannel.so`（0.24.2） |

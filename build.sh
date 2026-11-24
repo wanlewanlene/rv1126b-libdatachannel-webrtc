@@ -11,12 +11,12 @@ set -e
 
 CXX="${CXX:-g++}"
 TARGET="rv1126b_webrtc_push"
-SRC="main.cpp"
+SRC="cpp/main.cpp"
 
 CXXFLAGS="-std=c++17 -O2 -Wall"
 LIBS="-ldatachannel -lrockchip_mpp -lssl -lcrypto -pthread"
 
-# 音频链路：Opus 编码 + SpeexDSP 降噪 + ALSA 采集（main.cpp 的音频线程需要）
+# 音频链路：Opus 编码 + SpeexDSP 降噪 + ALSA 采集（cpp/main.cpp 的音频线程需要）
 if pkg-config --exists opus speexdsp alsa 2>/dev/null; then
     LIBS="$LIBS $(pkg-config --libs opus speexdsp alsa)"
 else
